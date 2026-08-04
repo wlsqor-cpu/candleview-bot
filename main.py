@@ -10,7 +10,7 @@ import pandas as pd
 import requests
 
 
-# 1. Render 포트 오픈 (0.1초 즉시 가동)
+# Render 웹 서비스용 포트 바인딩 (0.1초 즉시 오픈)
 def run_port_server():
     try:
         port = int(os.environ.get("PORT", 10000))
@@ -23,42 +23,24 @@ def run_port_server():
 
 threading.Thread(target=run_port_server, daemon=True).start()
 
-# 2. 유저 토큰 및 API 키 설정
+# 사용자 설정
 TELEGRAM_BOT_TOKEN = "8897306377:AAEZBAvMCLdUajN497MI65r593tZo1wHZCc"
 GEMINI_API_KEY = "AQ.Ab8RN6K4Yfao6wc_F1K8jgNdu0hZu-v4vutnFN78L3f52ukhHw"
 
-# 3. 파일 자동 탐색 및 안전 로드 (FileNotFoundError 100% 방지)
+# 78.15KB 원본 파일 자동 탐색 및 로드
 CANDLEVIEW_PROMPT_FULL = ""
-current_files = os.listdir(".")
-target_file_name = None
-
-for f in current_files:
+for f in os.listdir("."):
     if ("001" in f or "Candle" in f or "Api" in f) and f.endswith(".txt"):
-        target_file_name = f
-        break
-
-if target_file_name:
-    try:
-        with open(target_file_name, "r", encoding="utf-8") as file:
-            CANDLEVIEW_PROMPT_FULL = file.read()
-        print(f"🚀 엔진 파일({target_file_name}) 로드 성공!")
-    except Exception as e:
-        print(f"파일 로드 중 예외 발생: {e}")
+        try:
+            with open(f, "r", encoding="utf-8") as file:
+                CANDLEVIEW_PROMPT_FULL = file.read()
+            print(f"🚀 엔진 파일({f}) 로드 성공!")
+            break
+        except Exception:
+            pass
 
 if not CANDLEVIEW_PROMPT_FULL:
-    CANDLEVIEW_PROMPT_FULL = """
-✅ CandleView_API_V001 (PA-VSA 전용 API 데이터 정밀 연산 엔진)
-=== 0. 입력 인터페이스 ===
-필수 입력 규격: 코인명 (심볼, 예: BTCUSDT), 타임프레임 개수 선택: 2~4개 자유 선택
-=== 1. PHASE 실행 강제 규칙 ===
-1. PHASE 1 데이터 수집 표 작성.
-2. PHASE 2 개별 TF 분석, TF간 유기적 상관관계, 메인 시나리오, P_entry, P_inv, P_target_1/2, R:R 비율 완제 출력.
-=== 6. 정체성 및 사고 우선순위 ===
-PA-VSA 전용 기술적 차트 분석 엔진.
-=== 11. [Layer 5-A] PHASE 2 서술 출력 서식 ===
-① 개별 TF 분석 ➔ ② TF 간 유기적 상관관계 ➔ ③ 메인 시나리오 ➔ ④ 힘의 방향성 원리 ➔ ⑤ 리스크/기회/실행전략 수치화 ➔ ⑥ 신뢰도 라벨 ➔ ⑦ 투자판단 책임 고지 완제 출력.
-"""
-    print("기본 백업 프롬프트 로드 완료.")
+    CANDLEVIEW_PROMPT_FULL = "CandleView_API_V001 정밀 연산 엔진"
 
 
 # 업비트 전체 한글 코인 오토 매핑
@@ -69,9 +51,9 @@ def fetch_upbit_korean_map():
         k_map = {}
         for item in res:
             if item["market"].startswith("KRW-"):
-                symbol = item["market"].replace("KRW-", "")
+                sym = item["market"].replace("KRW-", "")
                 k_name = item["korean_name"].replace(" ", "").strip()
-                k_map[k_name] = symbol
+                k_map[k_name] = sym
         return k_map
     except Exception:
         return {}
@@ -96,14 +78,12 @@ def call_gemini_api_with_retry(full_prompt):
         "X-goog-api-key": GEMINI_API_KEY,
     }
     payload = {"contents": [{"parts": [{"text": full_prompt}]}]}
-
-    model_urls = [
+    urls = [
         "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent",
         "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent",
         "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent",
     ]
-
-    for url in model_urls:
+    for url in urls:
         for _ in range(2):
             try:
                 res = requests.post(url, headers=headers, json=payload)
@@ -119,33 +99,27 @@ def call_gemini_api_with_retry(full_prompt):
 
 
 def analyze_crypto_dynamic(
-    symbol_input="BTC",
-    exchange_name="bybit",
-    custom_tfs=["1d", "4h", "1h"],
+    symbol_input="BTC", exchange_name="bybit", custom_tfs=["1d", "4h", "1h"]
 ):
     try:
         ex_name = exchange_name.lower()
         if ex_name in ["업비트", "upbit"]:
             ex_name = "upbit"
-            quote_currency = "KRW"
+            quote = "KRW"
         elif ex_name in ["빗썸", "bithumb"]:
             ex_name = "bithumb"
-            quote_currency = "KRW"
+            quote = "KRW"
         else:
             ex_name = "bybit"
-            quote_currency = "USDT"
+            quote = "USDT"
 
-        clean_input = (
-            symbol_input.replace("/", "").replace(":", "").replace(" ", "")
-        )
-        symbol_upper = UPBIT_KOREAN_MAP.get(
-            clean_input, clean_input.upper()
-        )
+        clean = symbol_input.replace("/", "").replace(":", "").replace(" ", "")
+        symbol_upper = UPBIT_KOREAN_MAP.get(clean, clean.upper())
 
         exchange_class = getattr(ccxt, ex_name)()
-        symbol = f"{symbol_upper}/{quote_currency}"
+        symbol = f"{symbol_upper}/{quote}"
 
-        api_data_payload = f"[STAGE 0 사전 환경 점검]\n• 수집 거래소: {ex_name.upper()}\n• 수집 방식: ■ API Direct Data Stream\n• 데이터 출처: REST API Raw OHLCV & 수신 Close 기반 자체 계산 RMA-RSI 14 Array\n\n=== 코인명: {symbol} ===\n"
+        payload = f"[STAGE 0 사전 환경 점검]\n• 수집 거래소: {ex_name.upper()}\n• 수집 방식: ■ API Direct Data Stream\n\n=== 코인명: {symbol} ===\n"
 
         for tf in custom_tfs:
             ohlcv = exchange_class.fetch_ohlcv(symbol, timeframe=tf, limit=30)
@@ -163,20 +137,18 @@ def analyze_crypto_dynamic(
             df["rsi"] = calculate_rma_rsi(df["close"])
 
             recent = df.tail(10)
-            api_data_payload += f"\n[{tf} 타임프레임 API 수신 배열 (최근 10봉)]\n"
+            payload += f"\n[{tf} 타임프레임 API 수신 배열]\n"
             for _, row in recent.iterrows():
-                api_data_payload += f"O: {row['open']} | H: {row['high']} | L: {row['low']} | C: {row['close']} | V: {row['volume']:.2f} | RSI: {row['rsi']:.2f}\n"
+                payload += f"O: {row['open']} | H: {row['high']} | L: {row['low']} | C: {row['close']} | V: {row['volume']:.2f} | RSI: {row['rsi']:.2f}\n"
 
-        full_prompt = f"{CANDLEVIEW_PROMPT_FULL}\n\n[API 수신 원천 데이터]\n{api_data_payload}\n\n[실행 명령]\nPHASE 1 데이터 수집 표를 작성한 후, 사용자의 명시적 승인이 완료된 상태로 간주하여 PHASE 2 통합 브리핑까지 연속 완제 출력하십시오."
-
-        return call_gemini_api_with_retry(full_prompt)
-
+        prompt = f"{CANDLEVIEW_PROMPT_FULL}\n\n[API 수신 원천 데이터]\n{payload}\n\nPHASE 1 표 작성 후 PHASE 2 완제 브리핑까지 연속 완제 출력하십시오."
+        return call_gemini_api_with_retry(prompt)
     except Exception as e:
         return f"요청 처리 중 오류 발생: {e}"
 
 
-# 텔레그램 루프 365일 무한 구동
-print("🚀 365일 무중단 CandleView 봇 가동 시작!")
+# 텔레그램 메인 루프
+print("🚀 365일 무중단 CandleView 봇 구동 시작!")
 last_update_id = 0
 
 while True:
@@ -186,9 +158,9 @@ while True:
 
         for update in updates.get("result", []):
             last_update_id = update["update_id"]
-            message = update.get("message", {})
-            chat_id = message.get("chat", {}).get("id")
-            raw_text = message.get("text", "").strip()
+            msg = update.get("message", {})
+            chat_id = msg.get("chat", {}).get("id")
+            raw_text = msg.get("text", "").strip()
 
             if raw_text.startswith("/"):
                 clean_text = raw_text[1:].replace(":", " ").replace(",", " ")
@@ -198,27 +170,28 @@ while True:
 
                 cmd = parts[0].lower()
                 if cmd == "start":
+                    send_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
                     requests.post(
-                        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                        send_url,
                         json={
                             "chat_id": chat_id,
                             "text": (
-                                "👋 365일 무중단 CandleView AI 분석 봇입니다.\n\n[사용"
-                                " 예시]\n• /btc : 바이비트 비트코인 분석\n•"
-                                " /업비트 리플 : 업비트 리플 분석\n• /빗썸"
-                                " 도지코인 : 빗썸 도지코인 분석\n"
+                                "👋 365일 무중단 CandleView AI 분석"
+                                " 봇입니다.\n\n[사용 예시]\n• /btc : 바이비트"
+                                " 비트코인 분석\n• /업비트 리플 : 업비트 리플"
+                                " 분석\n• /빗썸 도지코인 : 빗썸 도지코인 분석\n"
                             ),
                         },
                     )
                     continue
 
-                exchange_name = "bybit"
-                symbol_name = cmd
-                custom_tfs = ["1d", "4h", "1h"]
+                ex_name = "bybit"
+                sym_name = cmd
+                tfs = ["1d", "4h", "1h"]
 
                 if len(parts) > 1:
-                    first_param = parts[0].lower()
-                    if first_param in [
+                    first_p = parts[0].lower()
+                    if first_p in [
                         "upbit",
                         "bybit",
                         "bithumb",
@@ -226,40 +199,32 @@ while True:
                         "업비트",
                         "빗썸",
                     ]:
-                        exchange_name = first_param
-                        symbol_name = parts[1]
+                        ex_name = first_p
+                        sym_name = parts[1]
                         if len(parts) > 2:
-                            custom_tfs = parts[2:]
+                            tfs = parts[2:]
                     else:
-                        custom_tfs = parts[1:]
+                        tfs = parts[1:]
 
-                symbol_clean = (
-                    symbol_name.replace("/", "").replace(" ", "").strip()
-                )
-                symbol_mapped = UPBIT_KOREAN_MAP.get(
-                    symbol_clean, symbol_clean.upper()
-                )
+                sym_clean = sym_name.replace("/", "").replace(" ", "").strip()
+                sym_mapped = UPBIT_KOREAN_MAP.get(sym_clean, sym_clean.upper())
                 quote = (
                     "KRW"
-                    if exchange_name in ["upbit", "bithumb", "업비트", "빗썸"]
+                    if ex_name in ["upbit", "bithumb", "업비트", "빗썸"]
                     else "USDT"
                 )
 
+                status_msg = f"⏳ [{ex_name.upper()}] {sym_mapped}/{quote} ({', '.join(tfs)}) API 수집 및 CandleView 연산 중..."
+                send_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
                 requests.post(
-                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                    json={
-                        "chat_id": chat_id,
-                        "text": f"⏳ [{exchange_name.upper()}] {symbol_mapped}/{quote} ({', '.join(custom_tfs)}) API 수집 및 CandleView 연산 중...",
-                    },
+                    send_url, json={"chat_id": chat_id, "text": status_msg}
                 )
 
-                result_text = analyze_crypto_dynamic(
-                    symbol_clean, exchange_name, custom_tfs
-                )
+                result_text = analyze_crypto_dynamic(sym_clean, ex_name, tfs)
 
                 for i in range(0, len(result_text), 4000):
                     requests.post(
-                        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                        send_url,
                         json={
                             "chat_id": chat_id,
                             "text": result_text[i : i + 4000],
