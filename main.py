@@ -10,7 +10,7 @@ import pandas as pd
 import requests
 
 
-# Render 웹 서비스용 포트 바인딩 (0.1초 즉시 오픈)
+# Render 포트 바인딩
 def run_port_server():
     try:
         port = int(os.environ.get("PORT", 10000))
@@ -47,7 +47,7 @@ if not CANDLEVIEW_PROMPT_FULL:
 def fetch_upbit_korean_map():
     try:
         url = "https://api.upbit.com/v1/market/all?isDetails=false"
-        res = requests.get(url).json()
+        res = requests.get(url, timeout=10).json()
         k_map = {}
         for item in res:
             if item["market"].startswith("KRW-"):
@@ -72,21 +72,25 @@ def calculate_rma_rsi(prices, period=14):
     return 100 - (100 / (1 + rs))
 
 
+# 💡 1순위: Gemini 1.5 Pro 최상위 고성능 모델 적용
 def call_gemini_api_with_retry(full_prompt):
     headers = {
         "Content-Type": "application/json",
         "X-goog-api-key": GEMINI_API_KEY,
     }
     payload = {"contents": [{"parts": [{"text": full_prompt}]}]}
+
+    # 1.5-pro 모델 1순위 배치
     urls = [
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent",
         "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent",
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent",
         "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent",
     ]
+
     for url in urls:
         for _ in range(2):
             try:
-                res = requests.post(url, headers=headers, json=payload)
+                res = requests.post(url, headers=headers, json=payload, timeout=60)
                 if res.status_code == 200:
                     return res.json()["candidates"][0]["content"]["parts"][0][
                         "text"
@@ -147,14 +151,15 @@ def analyze_crypto_dynamic(
         return f"요청 처리 중 오류 발생: {e}"
 
 
-# 텔레그램 메인 루프
-print("🚀 365일 무중단 CandleView 봇 구동 시작!")
+# 텔레그램 메인 루프 (프리징 차단 timeout=35 적용)
+print("🚀 Gemini 1.5 Pro 적용 및 프리징 방지 365일 봇 가동 시작!")
 last_update_id = 0
 
 while True:
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates?offset={last_update_id + 1}&timeout=30"
-        updates = requests.get(url).json()
+        # 💡 timeout=35 속성을 통해 무한 대기 프리징 현상 원천 차단
+        updates = requests.get(url, timeout=35).json()
 
         for update in updates.get("result", []):
             last_update_id = update["update_id"]
@@ -182,6 +187,7 @@ while True:
                                 " 분석\n• /빗썸 도지코인 : 빗썸 도지코인 분석\n"
                             ),
                         },
+                        timeout=10,
                     )
                     continue
 
@@ -214,10 +220,12 @@ while True:
                     else "USDT"
                 )
 
-                status_msg = f"⏳ [{ex_name.upper()}] {sym_mapped}/{quote} ({', '.join(tfs)}) API 수집 및 CandleView 연산 중..."
+                status_msg = f"⏳ [{ex_name.upper()}] {sym_mapped}/{quote} ({', '.join(tfs)}) API 수집 및 Gemini 1.5 Pro 정밀 연산 중..."
                 send_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
                 requests.post(
-                    send_url, json={"chat_id": chat_id, "text": status_msg}
+                    send_url,
+                    json={"chat_id": chat_id, "text": status_msg},
+                    timeout=10,
                 )
 
                 result_text = analyze_crypto_dynamic(sym_clean, ex_name, tfs)
@@ -225,10 +233,8 @@ while True:
                 for i in range(0, len(result_text), 4000):
                     requests.post(
                         send_url,
-                        json={
-                            "chat_id": chat_id,
-                            "text": result_text[i : i + 4000],
-                        },
+                        json={"chat_id": chat_id, "text": result_text[i : i + 4000]},
+                        timeout=10,
                     )
 
     except Exception as e:
