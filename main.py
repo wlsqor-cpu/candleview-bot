@@ -12,6 +12,18 @@ import pandas as pd
 import requests
 
 # ============================================================
+# 🛡️ 중복 인스턴스 원천 차단 (Render Rolling Deploy 완벽 대응)
+# ============================================================
+import fcntl, os
+_INSTANCE_LOCK = open("/tmp/candleview_single.lock", "w")
+try:
+    fcntl.flock(_INSTANCE_LOCK, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    print("[INFO] 중복 인스턴스 감지 → 자동 종료 (충돌 방지)")
+    os._exit(0)
+
+
+# ============================================================
 # 🔧 1. 공통 유틸리티: 로그 + Render Health Check
 # ============================================================
 def log(level, msg):
