@@ -33,18 +33,25 @@ if not TELEGRAM_BOT_TOKEN or not GEMINI_API_KEY:
     print("⚠️ 경고: TELEGRAM_BOT_TOKEN 또는 GEMINI_API_KEY 환경변수가 비어 있습니다. Render 대시보드 Environment에서 등록하세요.")
 
 # ============================================================
-# 엔진 파일 자동 탐색 및 로드
+# 엔진 파일 로드 (정확한 파일명 지정 + 디버그)
 # ============================================================
 CANDLEVIEW_PROMPT_FULL = ""
-for f in os.listdir("."):
-    if ("001" in f or "Candle" in f or "Api" in f) and f.endswith(".txt"):
-        try:
-            with open(f, "r", encoding="utf-8") as file:
-                CANDLEVIEW_PROMPT_FULL = file.read()
-            print(f"[INFO] 엔진 파일({f}) 로드 성공! 크기: {len(CANDLEVIEW_PROMPT_FULL):,}바이트")
-            break
-        except Exception:
-            pass
+TARGET_FILE = "CandleView_API_V001-3.txt"
+
+if os.path.exists(TARGET_FILE):
+    try:
+        with open(TARGET_FILE, "r", encoding="utf-8") as file:
+            CANDLEVIEW_PROMPT_FULL = file.read()
+        print(f"[INFO] 엔진 파일({TARGET_FILE}) 로드 성공! 크기: {len(CANDLEVIEW_PROMPT_FULL):,}바이트")
+    except Exception as e:
+        print(f"[ERROR] 엔진 파일 읽기 실패: {e}")
+else:
+    print(f"[ERROR] {TARGET_FILE} 파일이 존재하지 않습니다.")
+    print("[DEBUG] 현재 디렉토리 txt 파일 목록:")
+    for f in os.listdir("."):
+        if f.endswith(".txt"):
+            size = os.path.getsize(f)
+            print(f"  - {f} ({size:,} bytes)")
 
 if not CANDLEVIEW_PROMPT_FULL:
     CANDLEVIEW_PROMPT_FULL = "CandleView_API_V001 정밀 연산 엔진"
@@ -92,12 +99,10 @@ def call_gemini_api_with_retry(full_prompt):
     }
     payload = {"contents": [{"parts": [{"text": full_prompt}]}]}
 
-    # 2026년 기준 생존 가능성이 높은 정식/최신 모델 우선순위
+    # 실제 존재하는 모델만 사용
     urls = [
         "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent",
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent",
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent",
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent",
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent",
     ]
 
     for url in urls:
@@ -144,7 +149,7 @@ def analyze_crypto_dynamic(symbol_input="BTC", exchange_name="bybit", custom_tfs
             f"=== 코인명: {symbol} ===\n"
         )
 
-        # 120봉 수집 → 최근 100봉 전송 (RSI 워밍업 + 프롬프트 요구사항 충족)
+        # 120봉 수집 → 최근 100봉 전송
         for tf in custom_tfs:
             ohlcv = exchange_class.fetch_ohlcv(symbol, timeframe=tf, limit=120)
             df = pd.DataFrame(
@@ -176,7 +181,7 @@ def analyze_crypto_dynamic(symbol_input="BTC", exchange_name="bybit", custom_tfs
 # ============================================================
 # 텔레그램 메인 루프
 # ============================================================
-print("🚀 CandleView AI 봇 가동 시작 (Gemini 3.x Flash 우선)")
+print("🚀 CandleView AI 봇 가동 시작 (Gemini 3.6 / 3.5-lite)")
 
 # 409 Conflict 예방: 기존 webhook 강제 삭제
 try:
