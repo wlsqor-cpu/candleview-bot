@@ -23,9 +23,12 @@ def run_port_server():
 
 threading.Thread(target=run_port_server, daemon=True).start()
 
-# 사용자 설정
-TELEGRAM_BOT_TOKEN = "8897306377:AAEZBAvMCLdUajN497MI65r593tZo1wHZCc"
-GEMINI_API_KEY = "AQ.Ab8RN6K4Yfao6wc_F1K8jgNdu0hZu-v4vutnFN78L3f52ukhHw"
+# 사용자 설정 — 환경변수에서 로드 (하드코딩 금지)
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+
+if not TELEGRAM_BOT_TOKEN or not GEMINI_API_KEY:
+    print("⚠️ 경고: TELEGRAM_BOT_TOKEN 또는 GEMINI_API_KEY 환경변수가 비어 있습니다. Render 대시보드 Environment에서 등록하세요.")
 
 # 78.15KB 원본 파일 자동 탐색 및 로드
 CANDLEVIEW_PROMPT_FULL = ""
@@ -34,7 +37,7 @@ for f in os.listdir("."):
         try:
             with open(f, "r", encoding="utf-8") as file:
                 CANDLEVIEW_PROMPT_FULL = file.read()
-            print(f"🚀 엔진 파일({f}) 로드 성공!")
+                print(f"🚀 엔진 파일({f}) 로드 성공!")
             break
         except Exception:
             pass
@@ -72,7 +75,8 @@ def calculate_rma_rsi(prices, period=14):
     return 100 - (100 / (1 + rs))
 
 
-# 💡 1순위: Gemini 1.5 Pro 최상위 고성능 모델 적용
+# 💡 현재(2026.8) 생존 확인된 정식(GA) 모델 우선순위 적용
+# gemini-1.5-pro/flash: 완전 폐기(404) / gemini-2.5-flash: 2026.10.16 종료 예정(조기 중단 사례 보고) → 제외
 def call_gemini_api_with_retry(full_prompt):
     headers = {
         "Content-Type": "application/json",
@@ -80,10 +84,10 @@ def call_gemini_api_with_retry(full_prompt):
     }
     payload = {"contents": [{"parts": [{"text": full_prompt}]}]}
 
-    # 1.5-pro 모델 1순위 배치
+    # 종료일 미발표 정식(GA) 모델 우선 배치
     urls = [
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent",
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent",
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent",
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent",
         "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent",
     ]
 
@@ -92,9 +96,7 @@ def call_gemini_api_with_retry(full_prompt):
             try:
                 res = requests.post(url, headers=headers, json=payload, timeout=60)
                 if res.status_code == 200:
-                    return res.json()["candidates"][0]["content"]["parts"][0][
-                        "text"
-                    ]
+                    return res.json()["candidates"][0]["content"]["parts"][0]["text"]
                 elif res.status_code == 503:
                     time.sleep(3)
             except Exception:
@@ -125,8 +127,9 @@ def analyze_crypto_dynamic(
 
         payload = f"[STAGE 0 사전 환경 점검]\n• 수집 거래소: {ex_name.upper()}\n• 수집 방식: ■ API Direct Data Stream\n\n=== 코인명: {symbol} ===\n"
 
+        # 데이터량 확충: 120봉 수집(RSI 워밍업 여유분 포함) → 100봉 전송(프롬프트의 "최근 100봉 내 SH/SL" 요구사항 충족)
         for tf in custom_tfs:
-            ohlcv = exchange_class.fetch_ohlcv(symbol, timeframe=tf, limit=30)
+            ohlcv = exchange_class.fetch_ohlcv(symbol, timeframe=tf, limit=120)
             df = pd.DataFrame(
                 ohlcv,
                 columns=[
@@ -140,8 +143,8 @@ def analyze_crypto_dynamic(
             )
             df["rsi"] = calculate_rma_rsi(df["close"])
 
-            recent = df.tail(10)
-            payload += f"\n[{tf} 타임프레임 API 수신 배열]\n"
+            recent = df.tail(100)
+            payload += f"\n[{tf} 타임프레임 API 수신 배열 (최근 {len(recent)}봉)]\n"
             for _, row in recent.iterrows():
                 payload += f"O: {row['open']} | H: {row['high']} | L: {row['low']} | C: {row['close']} | V: {row['volume']:.2f} | RSI: {row['rsi']:.2f}\n"
 
@@ -152,7 +155,7 @@ def analyze_crypto_dynamic(
 
 
 # 텔레그램 메인 루프 (프리징 차단 timeout=35 적용)
-print("🚀 Gemini 1.5 Pro 적용 및 프리징 방지 365일 봇 가동 시작!")
+print("🚀 Gemini 3.x Flash 적용 및 프리징 방지 365일 봇 가동 시작!")
 last_update_id = 0
 
 while True:
@@ -220,7 +223,7 @@ while True:
                     else "USDT"
                 )
 
-                status_msg = f"⏳ [{ex_name.upper()}] {sym_mapped}/{quote} ({', '.join(tfs)}) API 수집 및 Gemini 1.5 Pro 정밀 연산 중..."
+                status_msg = f"⏳ [{ex_name.upper()}] {sym_mapped}/{quote} ({', '.join(tfs)}) API 수집 및 Gemini 정밀 연산 중..."
                 send_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
                 requests.post(
                     send_url,
