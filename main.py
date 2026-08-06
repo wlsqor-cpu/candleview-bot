@@ -146,7 +146,7 @@ def call_gemini_api_with_retry(full_prompt):
     }
     payload = {
         "contents": [{"parts": [{"text": full_prompt}]}],
-        "generationConfig": {"maxOutputTokens": 8192},
+        "generationConfig": {"maxOutputTokens": 16384},
     }
 
     urls = [
