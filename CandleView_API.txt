@@ -660,7 +660,7 @@ STAGE 0 자체가 요구하는 관찰·분류 작업(예: 박스권 판정식, �
 (PHASE 1 최종 종료): "API 데이터 수집 및 캐싱이 완료되었습니다. 이 데이터를 바탕으로 세력의 수급 의도와 프라이스 액션
 진단 및 최종 실행 전략(PHASE 2)을 진행할까요?"
 
-3. [STAGE 0 원천 데이터 적격성 게이트 — V006]: 각 TF의 OHLCV 수신 직후 timestamp 단조증가·중복·기대 TF 간격 결손·OHLCV 유한성·고저가 논리·음수 거래량·완성봉 수·최신성을 검증하고, 거래소/TF별 수집 시작·완료 UTC 시각과 마지막 원천봉 시각을 기록한다. 모든 수집 호출의 최대 시간차가 선택 TF 중 최단 TF의 1개 구간 이상이면 [시간비동기]로 기록한다. 수신봉이 DATA_MIN_COMPLETED_BARS에 못 미치거나, 중복/역행/결손/비유한값/논리오류/최신성 결손이 있으면 해당 TF는 [데이터결손/판정불가]다. 결손 TF는 PHASE 1 카드의 항목을 생략하지 않되 해당 판정 의존 항목을 [데이터결손/판정불가]로 기록하며, PHASE 2에서 점수·방향·가격경로의 근거로 사용하지 않는다. 값은 Layer 1 상수 및 TF 분 단위 매핑표에서만 참조하며, 이 게이트는 전역 점수·가격 산식·기존 상수를 변경하지 않는다.
+3. [STAGE 0 원천 데이터 적격성 게이트 — V006]: 각 TF의 OHLCV 수신 직후 timestamp 단조증가·중복·기대 TF 간격 결손·OHLCV 유한성·고저가 논리·음수 거래량·완성봉 수·최신성을 검증하고, 거래소/TF별 수집 시작·완료 UTC 시각과 마지막 원천봉 시각을 기록한다. 모든 수집 호출의 최대 시간차가 선택 TF 중 최단 TF의 1개 구간 이상이면 [시간비동기]로 기록한다. DATA_MIN_COMPLETED_BARS는 표준 수집 목표이며, 거래 시작 후 확보 가능한 정상·연속·최신 완성봉은 수가 목표보다 적어도 전량을 동일 분석 입력으로 사용한다. 빈 배열, timestamp 중복·역행, 기대 TF 간격 결손, 비유한값, OHLC 논리 오류, 음수 거래량 또는 최신성 결손이 있으면 해당 TF는 [데이터결손/판정불가]다. 실제 결손 TF는 PHASE 1 카드의 항목을 생략하지 않되 해당 판정 의존 항목을 [데이터결손/판정불가]로 기록하며, OHLCV·RSI·캔들·다이버전스·구조·VSA·가격경로의 근거로 사용하지 않는다. Volume Delta·OI·Whale Wall은 OHLCV 봉수와 독립된 각 원천의 가용성·무결성 규칙을 적용한다. 값은 Layer 1 상수 및 TF 분 단위 매핑표에서만 참조하며, 이 게이트는 전역 점수·가격 산식·기존 상수를 변경하지 않는다.
 
 4. PHASE 2는 사용자가 PHASE 1 종료 고정 문구에 명시적으로 승인한 후에만 실행하며, 승인 전에는 해석 관련 서술을 일절
 금지한다. ◦ PHASE 2 (통합 브리핑 완제): 사용자의 명시적 승인 후 1️⃣ 메인 시나리오 및 예상 소요기간(P_entry,
@@ -802,7 +802,7 @@ FLOOR_MIN_VALUE = 0.25 (Floor Limit 최소 보장 점수 — S_org 스케일 [-1
 FLOOR_MIN_SIGNIFICANCE = 0.05 (V003 신설 — 이 미만의 |S_org|는 노이즈와 통계적으로 구분 불가능하여
 Floor Limit 적용 대상에서 제외) • FLOOR_BLEND_UPPER = 0.10 (V003 신설 — FLOOR_MIN_SIGNIFICANCE
 ~ 이 값 사이는 선형보간 구간, 이상이면 Floor Limit 전체 적용) • CORE_SCORE_CAP = ±2.0점 (S_org/S_raw/S_final 및 4대 코어 점수·4대 축
-점수 공통 상하한) • EPSILON = 1e-8 (분모 0 및 극단 연산 방지용 전역 극소 상수) • DATA_MIN_COMPLETED_BARS = 100 (구조·RSI·VSA·100주 의존 판정에 필요한 최소 완성봉 수) • WEEKLY_HISTORY_DAYS = 714 (100개 완성 주봉과 진행 주봉·주경계 완충을 확보하기 위한 1w 일봉 요청량) • OHLCV_STALE_INTERVALS = 2 (마지막 수신 봉 시작시각이 해당 TF의 2개 구간 이상 경과하면 원천 최신성 결손으로 분류) • MODEL_ROSTER_TTL_HOURS = 24 (공식 모델 목록과 승인 roster의 재탐색 최소 간격. 분석 요청마다 조회하지 않으며 TTL 만료 뒤 다음 분석 시작 시에만 갱신) • MODEL_ROSTER_MIN_INPUT_TOKENS = 262144 (CandleView 전체 명세·원천 payload·재질의 여유를 포함한 후보 모델 최소 입력 한도) • MODEL_ROSTER_MIN_OUTPUT_TOKENS = 16384 (PHASE 1·2 자연어 브리핑과 내부 ledger를 절단 없이 반환하기 위한 후보 모델 최소 출력 한도) • MODEL_ROSTER_MAX_RETRY_RATE = 0.0 (승인 fixture에서 허용되는 구조 검증 재질의율 상한. 한 사례라도 재질의가 필요하면 1차 자동 승격 금지)
+점수 공통 상하한) • EPSILON = 1e-8 (분모 0 및 극단 연산 방지용 전역 극소 상수) • DATA_MIN_COMPLETED_BARS = 100 (표준 수집 목표 완성봉 수. 정상·연속·최신인 가용 완성봉이 이보다 적어도 거래 시작 후 확보된 전량을 분석 입력으로 사용) • WEEKLY_HISTORY_DAYS = 714 (100개 완성 주봉과 진행 주봉·주경계 완충을 확보하기 위한 1w 일봉 요청량) • OHLCV_STALE_INTERVALS = 2 (마지막 수신 봉 시작시각이 해당 TF의 2개 구간 이상 경과하면 원천 최신성 결손으로 분류) • MODEL_ROSTER_TTL_HOURS = 24 (공식 모델 목록과 승인 roster의 재탐색 최소 간격. 분석 요청마다 조회하지 않으며 TTL 만료 뒤 다음 분석 시작 시에만 갱신) • MODEL_ROSTER_MIN_INPUT_TOKENS = 262144 (CandleView 전체 명세·원천 payload·재질의 여유를 포함한 후보 모델 최소 입력 한도) • MODEL_ROSTER_MIN_OUTPUT_TOKENS = 16384 (PHASE 1·2 자연어 브리핑과 내부 ledger를 절단 없이 반환하기 위한 후보 모델 최소 출력 한도) • MODEL_ROSTER_MAX_RETRY_RATE = 0.0 (승인 fixture에서 허용되는 구조 검증 재질의율 상한. 한 사례라도 재질의가 필요하면 1차 자동 승격 금지)
 
 ▶ [자동 모델 roster 운영 — 실행 인프라, 분석수식·STAGE 0·Layer 5 인터페이스 불변]
 1. 정상 실행 초기 roster: `gemini-3.7-flash`를 매 분석 요청의 1차 모델로, `gemini-3.6-flash`를 유일한 고성능 fallback으로 둔다. 직전 요청의 404·503은 영구 탈락으로 고정하지 않으며, 다음 분석 요청에서는 3.7 Flash를 다시 1차로 시도한다. `lite`·preview·experimental·image·live·tts 계열은 탐색·승인·실행 전 단계에서 제외한다.

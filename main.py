@@ -514,7 +514,9 @@ def validate_ohlcv_quality(ohlcv, tf, collected_at_utc):
         "completed_bars": max((len(ohlcv) if ohlcv else 0) - 1, 0),
         "last_source_timestamp_ms": None,
         "expected_interval_seconds": expected_seconds,
+        "standard_target_completed_bars": DATA_MIN_COMPLETED_BARS,
         "status": "적격",
+        "history_note": "",
         "reasons": reasons,
     }
     if DATA_MIN_COMPLETED_BARS is None or OHLCV_STALE_INTERVALS is None or expected_seconds is None:
@@ -554,16 +556,23 @@ def validate_ohlcv_quality(ohlcv, tf, collected_at_utc):
     quality["latest_age_seconds"] = age_ms / 1000.0
     if age_ms > OHLCV_STALE_INTERVALS * expected_ms:
         reasons.append("마지막 원천봉 최신성 결손")
+    # DATA_MIN_COMPLETED_BARS는 표준 수집 목표값이다. 신규 상장처럼 정상·연속·최신인
+    # 가용 완성봉이 목표보다 적어도 거래 시작 후 확보된 전량으로 동일 분석을 진행한다.
     if quality["completed_bars"] < DATA_MIN_COMPLETED_BARS:
-        reasons.append(f"완성봉 부족({quality['completed_bars']}<{DATA_MIN_COMPLETED_BARS})")
+        quality["status"] = "가용봉 분석"
+        quality["history_note"] = (
+            f"표준 수집 목표 {DATA_MIN_COMPLETED_BARS}봉 미달; "
+            f"거래 시작 후 확보 가능한 완성봉 {quality['completed_bars']}개 전체 사용"
+        )
 
+    # 실제 원천 무결성 오류만 분석 제외 상태로 전환한다.
     if reasons:
         quality["status"] = "데이터결손/판정불가"
     return quality
 
 
 def format_ohlcv_quality(quality):
-    detail = "; ".join(quality["reasons"]) if quality["reasons"] else "검사 통과"
+    detail = "; ".join(quality["reasons"]) if quality["reasons"] else (quality.get("history_note") or "검사 통과")
     last_ts = quality["last_source_timestamp_ms"]
     last_text = datetime.fromtimestamp(last_ts / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC") if last_ts else "없음"
     return (
@@ -1724,6 +1733,21 @@ def run_phase1(symbol_input, exchange_name, custom_tfs):
             quality["fetch_finished_utc"] = tf_fetch_finished.isoformat(timespec="seconds") + "Z"
             tf_quality_list.append(quality)
             snapshot_events.extend((tf_fetch_started, tf_fetch_finished))
+            payload += f"\n[{tf} 원천 데이터 품질 감사]\n{format_ohlcv_quality(quality)}\n"
+
+            # 실제 원천 무결성 결손은 OHLCV 및 그 파생값을 분석 입력에서 제외한다.
+            # 가용 이력 부족(가용봉 분석)은 이 분기에 들어오지 않으며 전체 봉을 그대로 사용한다.
+            if quality["status"] == "데이터결손/판정불가":
+                payload += f"[{tf} 분석 입력 제외] 원천 무결성 결손으로 OHLCV·RSI·캔들·다이버전스·구조 데이터를 사용하지 않습니다.\n"
+                tf_delta_info = fetch_volume_delta_summary(exchange_class, symbol, tf, limit=120)
+                tf_delta_list.append({"tf": tf, "info": tf_delta_info})
+                payload += f"\n[{tf} Volume Delta (Plugin 7)]\n"
+                if tf_delta_info and tf_delta_info.get("status") == "ok":
+                    payload += f"source: {tf_delta_info.get('source')} | last_Delta_Ratio: {tf_delta_info.get('last_delta_ratio'):+.4f}\n"
+                else:
+                    payload += "[거래소 미지원 또는 데이터결손] Volume Delta 수집 불가\n"
+                continue
+
             df = pd.DataFrame(
                 ohlcv,
                 columns=["timestamp", "open", "high", "low", "close", "volume"],
@@ -1739,7 +1763,6 @@ def run_phase1(symbol_input, exchange_name, custom_tfs):
             if len(recent) > 0:
                 last_close = float(recent.iloc[-1]["close"])
 
-            payload += f"\n[{tf} 원천 데이터 품질 감사]\n{format_ohlcv_quality(quality)}\n"
             payload += f"\n[{tf} 타임프레임 API 수신 배열 (최근 {len(recent)}봉)]\n"
             n_rows = len(recent)
             check_today = is_subday_tf(tf)
