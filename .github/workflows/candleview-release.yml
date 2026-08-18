@@ -1,0 +1,124 @@
+name: CandleView Release File Resolver
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "releases/**"
+
+permissions:
+  contents: write
+
+jobs:
+  resolve-and-promote:
+    name: Validate and promote one CandleView file pair
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve, validate, and promote source files
+        shell: bash
+        env:
+          EVENT_BEFORE_SHA: ${{ github.event.before }}
+          EVENT_AFTER_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          normalize_name() {
+            LC_ALL=C tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]//g'
+          }
+
+          main_candidates=()
+          spec_candidates=()
+
+          # 이전 releases 파일 전체를 재탐색하지 않는다. 현재 push 커밋에서 바뀐 파일만
+          # 후보로 사용하므로, 버전 파일을 누적 보관해도 오래된 파일을 오인하지 않는다.
+          mapfile -d '' changed_release_paths < <(
+            git diff --name-only -z "$EVENT_BEFORE_SHA" "$EVENT_AFTER_SHA" -- releases/
+          )
+          if [[ ${#changed_release_paths[@]} -eq 0 ]]; then
+            echo "No changed release files were found in this push." >&2
+            exit 1
+          fi
+
+          for path in "${changed_release_paths[@]}"; do
+            [[ -f "$path" ]] || continue
+            base_name="${path##*/}"
+            normalized="$(printf '%s' "$base_name" | normalize_name)"
+            lower_name="$(printf '%s' "$base_name" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
+
+            if [[ "$lower_name" == *.py && "$normalized" == *main* ]]; then
+              main_candidates+=("$path")
+            fi
+            if [[ "$lower_name" == *.txt && "$normalized" == *candleviewapi* ]]; then
+              spec_candidates+=("$path")
+            fi
+          done
+
+          if [[ ${#main_candidates[@]} -ne 1 ]]; then
+            echo "Expected exactly one main.py candidate under releases/, found ${#main_candidates[@]}." >&2
+            printf 'Candidates:\n%s\n' "${main_candidates[*]:-none}" >&2
+            exit 1
+          fi
+          if [[ ${#spec_candidates[@]} -ne 1 ]]; then
+            echo "Expected exactly one CandleView_API.txt candidate under releases/, found ${#spec_candidates[@]}." >&2
+            printf 'Candidates:\n%s\n' "${spec_candidates[*]:-none}" >&2
+            exit 1
+          fi
+
+          main_source="${main_candidates[0]}"
+          spec_source="${spec_candidates[0]}"
+
+          if [[ ! -s "$main_source" || ! -s "$spec_source" ]]; then
+            echo "Source files must not be empty." >&2
+            exit 1
+          fi
+
+          python3 -m py_compile "$main_source"
+          grep -q '^def run_phase1' "$main_source"
+          grep -q '^def run_phase2' "$main_source"
+          grep -q 'CANDLEVIEW_PROMPT_FULL' "$main_source"
+          grep -qi 'CandleView' "$spec_source"
+          grep -q 'STAGE 0' "$spec_source"
+
+          cp "$main_source" .incoming_main.py
+          cp "$spec_source" .incoming_CandleView_API.txt
+          python3 -m py_compile .incoming_main.py
+
+          changed=0
+          if ! cmp -s .incoming_main.py main.py; then
+            mv .incoming_main.py main.py
+            changed=1
+          else
+            rm .incoming_main.py
+          fi
+          if ! cmp -s .incoming_CandleView_API.txt CandleView_API.txt; then
+            mv .incoming_CandleView_API.txt CandleView_API.txt
+            changed=1
+          else
+            rm .incoming_CandleView_API.txt
+          fi
+
+          if [[ "$changed" -eq 0 ]]; then
+            echo "Validated candidate pair already matches the deployed canonical files." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          sha256sum main.py CandleView_API.txt | tee -a "$GITHUB_STEP_SUMMARY"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add main.py CandleView_API.txt
+          git commit -m "chore: promote validated CandleView release files"
+          git push origin HEAD:main
+
+          {
+            echo "## CandleView release promoted"
+            echo
+            echo "- Source main: \`$main_source\`"
+            echo "- Source specification: \`$spec_source\`"
+          } >> "$GITHUB_STEP_SUMMARY"
