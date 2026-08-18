@@ -709,7 +709,7 @@ MIN_VALID_RANGE_RATIO 인 경우, 컨테이너 분석을 자동 보류하고 Kz 
 확정 귀속되므로, 완충 보간은 오직 경계값 미만 구간에서만 편측 적용한다. Pos%가 각 Zone 경계값에서 -2%p 이내(예:
 경계값 20 기준 18~20% 구간)인 경우, 하위 Zone과 상위 Zone의 기본 Kz 값을 선형 보간(Linear
 Interpolation)한다. 비대칭 Zone(0·4)이 포함된 경우 현재 S_org 부호에 해당하는 분기 Kz를 먼저 선택한 뒤
-보간한다. 보간식: Kz_buffered = Kz_lower + (Kz_upper - Kz_lower) × (Pos% - (경계값 
+보간한다. 보간식: Kz_buffered = Kz_lower + (Kz_upper - Kz_lower) × (Pos% - (경계값
 - 2.0)) / 2.0
 6. 최종 Kz 확정: Kz = MAX(0.3, MIN(1.8, Kz)) (2차 클램핑 [0.3, 1.8], 양수 고정)
 7. ▶ Kz 연산 유효 범위 및 예외 규정 (V002-14 명확화)
@@ -802,16 +802,14 @@ FLOOR_MIN_VALUE = 0.25 (Floor Limit 최소 보장 점수 — S_org 스케일 [-1
 FLOOR_MIN_SIGNIFICANCE = 0.05 (V003 신설 — 이 미만의 |S_org|는 노이즈와 통계적으로 구분 불가능하여
 Floor Limit 적용 대상에서 제외) • FLOOR_BLEND_UPPER = 0.10 (V003 신설 — FLOOR_MIN_SIGNIFICANCE
 ~ 이 값 사이는 선형보간 구간, 이상이면 Floor Limit 전체 적용) • CORE_SCORE_CAP = ±2.0점 (S_org/S_raw/S_final 및 4대 코어 점수·4대 축
-점수 공통 상하한) • EPSILON = 1e-8 (분모 0 및 극단 연산 방지용 전역 극소 상수) • DATA_MIN_COMPLETED_BARS = 100 (표준 수집 목표 완성봉 수. 정상·연속·최신인 가용 완성봉이 이보다 적어도 거래 시작 후 확보된 전량을 분석 입력으로 사용) • WEEKLY_HISTORY_DAYS = 714 (100개 완성 주봉과 진행 주봉·주경계 완충을 확보하기 위한 1w 일봉 요청량) • OHLCV_STALE_INTERVALS = 2 (마지막 수신 봉 시작시각이 해당 TF의 2개 구간 이상 경과하면 원천 최신성 결손으로 분류) • MODEL_ROSTER_TTL_HOURS = 24 (공식 모델 목록과 승인 roster의 재탐색 최소 간격. 분석 요청마다 조회하지 않으며 TTL 만료 뒤 다음 분석 시작 시에만 갱신) • MODEL_ROSTER_MIN_INPUT_TOKENS = 262144 (CandleView 전체 명세·원천 payload·재질의 여유를 포함한 후보 모델 최소 입력 한도) • MODEL_ROSTER_MIN_OUTPUT_TOKENS = 16384 (PHASE 1·2 자연어 브리핑과 내부 ledger를 절단 없이 반환하기 위한 후보 모델 최소 출력 한도) • MODEL_ROSTER_MAX_RETRY_RATE = 0.0 (승인 fixture에서 허용되는 구조 검증 재질의율 상한. 한 사례라도 재질의가 필요하면 1차 자동 승격 금지)
+점수 공통 상하한) • EPSILON = 1e-8 (분모 0 및 극단 연산 방지용 전역 극소 상수) • DATA_MIN_COMPLETED_BARS = 100 (표준 수집 목표 완성봉 수. 정상·연속·최신인 가용 완성봉이 이보다 적어도 거래 시작 후 확보된 전량을 분석 입력으로 사용) • WEEKLY_HISTORY_DAYS = 714 (100개 완성 주봉과 진행 주봉·주경계 완충을 확보하기 위한 1w 일봉 요청량) • OHLCV_STALE_INTERVALS = 2 (마지막 수신 봉 시작시각이 해당 TF의 2개 구간 이상 경과하면 원천 최신성 결손으로 분류)
 
-▶ [자동 모델 roster 운영 — 실행 인프라, 분석수식·STAGE 0·Layer 5 인터페이스 불변]
-1. 정상 실행 초기 roster: `gemini-3.7-flash`를 매 분석 요청의 1차 모델로, `gemini-3.6-flash`를 유일한 고성능 fallback으로 둔다. 직전 요청의 404·503은 영구 탈락으로 고정하지 않으며, 다음 분석 요청에서는 3.7 Flash를 다시 1차로 시도한다. `lite`·preview·experimental·image·live·tts 계열은 탐색·승인·실행 전 단계에서 제외한다.
-2. 후보 탐색 시점: TTL은 분석 시작 전 차단 검사가 아니라, 성공한 분석 응답 뒤의 사후 검토 최소 간격이다. TTL 만료 후 공식 `models.list`와 fixture 검토는 비동기로 수행하며, 후보 탐색·fixture 실패가 진행 중인 분석의 모델 선택·응답·지연을 바꾸지 않는다.
-3. 적격성 하드게이트: `generateContent` 지원, 안정 식별자, 최소 입력·출력 한도, 구조화 응답, PHASE 2 경계, RSI·반대근거·조건부 문구, ledger, 인라인 검증을 모두 통과하고 재질의율이 `MODEL_ROSTER_MAX_RETRY_RATE` 이하여야 한다. 하나라도 실패한 후보는 승인 roster에 넣지 않는다.
-4. 품질·논리 무결성 승격: 도전자 Q와 기존 1차 I에 대해 `quality_rate(Q) ≥ quality_rate(I)` 그리고 `retry_rate(Q) ≤ retry_rate(I)`를 모두 만족하고, 둘 중 하나가 엄격히 개선될 때만 Q를 1차로 승격한다. 기존 1차 I는 유일한 fallback으로 이동한다. 승인 실행 roster는 최대 2개로 제한하며, 우위가 증명되지 않은 후보는 관측값으로만 보존한다.
-5. 비용·지연 분리: `median_total_tokens`, `median_latency_seconds`는 승인 roster의 운영 관측값으로만 보존한다. 두 값의 증가만으로 품질·논리 무결성 개선 후보의 승격을 막지 않는다.
-6. 상태 무결성: roster 스키마가 변경되면 이전 캐시는 고성능 초기 roster로 안전 재생성한다. 목록 조회·fixture·저장 실패는 마지막 성공 roster 또는 고성능 초기 roster를 유지하며, 부분 저장은 허용하지 않는다.
-7. 출력·실패 규칙: 각 Telegram AI 해석 출력 상단에 실제 호출 모델과 fallback 여부를 표시한다. 두 고성능 모델 호출이 모두 실패한 그 실행에만 보류·실패 안내를 발행하며, 가격·방향·확률·목표가를 발행하지 않는다. Python 원천 수집·보간지표는 Gemini 실패와 독립적으로 열람 가능해야 한다.
+▶ [고정 승인 모델 운영 — 실행 인프라, 분석수식·STAGE 0·Layer 5 인터페이스 불변]
+1. 실행 모델은 수동 승인된 `gemini-3.7-flash`(1차)와 `gemini-3.6-flash`(유일한 fallback) 두 개로 고정한다. 이 목록 밖의 모델은 탐색·등록·실행하지 않는다.
+2. PHASE 1은 위 순서로 호출한다. PHASE 1에서 실제 성공한 모델 식별자를 기록하고, 사용자가 승인한 PHASE 2는 그 동일 모델만 호출한다. PHASE 2에서는 다른 모델로 자동 fallback하지 않는다.
+3. 일반 분석 요청에는 모델 목록 조회, 후보 fixture, TTL, 상태 파일, 비동기 모델 재승인 호출을 두지 않는다. 따라서 사용자 분석의 Gemini 할당량은 해당 분석의 PHASE 1·PHASE 2 호출에만 사용된다.
+4. 모델 교체·추가는 운영자가 별도 검증을 완료한 뒤 이 고정 목록과 본 명세를 함께 수동 갱신하여 배포할 때만 허용한다. 자동 승격은 허용하지 않는다.
+5. 각 Telegram AI 해석 출력 상단에는 실제 호출 모델과 PHASE 1 fallback 여부를 표시한다. PHASE 2의 고정 모델이 429 할당량 도달이면 다른 모델로 전환하지 않고 보류·재시도 안내만 발행하며, 가격·방향·확률·목표가를 발행하지 않는다.
 
 ▶ [Plugin 6 전용 신규 전역 표준 상수 — SSOT] • ER_W_VR = 0.25 (거래량 절대 강도 지표 가중치) • ER_W_PR
 = 0.25 (가격 진행률 지표 가중치) • ER_W_CORE = 0.30 (노력 대 결과 핵심 지표 가중치) • ER_W_FOLLOW
@@ -859,7 +857,7 @@ Layer 3.5 Force Score 최종 확정 직후 / Layer 4 4대 축 집계 진입 직�
 (신호 종류 불변 게이트): 곱셈 구조 적용으로 SIGN(S_raw) != SIGN(S_org) 발생 가능성 소멸 (통과). ◦ G3
 (진행봉 이중 상한 게이트): 미종료 진행봉 신호는 [Layer 3 방향성 벡터 산출 항목의 최대 상한 CORE_SCORE_CAP 중
 양의 상한 2.0점] 기준 50%인 1.0점을 초과할 수 없다. 보정 후 값 |S_raw| > 1.0 시 S_final = 1.0 ×
-SIGN(S_raw)로 강제 고정. ◦ G4 (상위 신호 보호 게이트 — 상위 0점 파괴 방지 교정): 
+SIGN(S_raw)로 강제 고정. ◦ G4 (상위 신호 보호 게이트 — 상위 0점 파괴 방지 교정):
 입력값은 G1~G3를 통과한 중간값(S_mid_low / S_mid_high)을 사용한다. (최종 S_final을 참조하지 않음 → 순환 정의 제거)
 |S_mid_high| > 0 (상위 TF 비중립) 조건이 충족되고 |S_mid_low| > |S_mid_high| × UPPER_TF_PROTECTION_RATIO(0.90) 인 경우에만
 S_mid_low = |S_mid_high| × UPPER_TF_PROTECTION_RATIO(0.90) × SIGN(S_mid_low) 제약을 적용한다.
@@ -1189,7 +1187,7 @@ F4 (지지와 저항의 임계 경계) 조건 대조 후 사전 검출된 F-N �
 4. [입력 캔들 결손 시 처리]: 돌파 확정 대상 캔들이 [데이터결손] 상태인 경우 "구조 돌파 여부 판정 불가(형태 미확인)"로 기록한다.
 • 방향성 벡터(V_A) 및 코어 점수(S_A_core) 산출: ◦ 상방 BOS 또는 상방 정식 CHoCH 확정 ➔ V_A = +1 ◦
 하방 BOS 또는 하방 정식 CHoCH 확정 ➔ V_A = -1 ◦ 잠정 CHoCH / Sweep / 구간 박스 내 횡보 ➔ V_A
-= 0 ◦ 코어 점수 공식 (V002-14 정규화): 
+= 0 ◦ 코어 점수 공식 (V002-14 정규화):
 V_A ≠ 0이고 강한 돌파 기준(VOL_ABSORPTION_MIN(1.5배) 이상 + BODY_RATIO_STRONG(69.0% 초과) 마감) 동시 충족 시 S_A_core = 1.0
 V_A ≠ 0이나 강한 돌파 미해당 시 S_A_core = 0.5
 V_A = 0 시 S_A_core = 0.0
@@ -1462,7 +1460,7 @@ Wall-Match는 우세 등급·방향·확률·예상경로·P_entry/P_inv/P_targe
 CHoCH ➔ 매도 저항. 거래량 1.5배 이상 대형 음봉 연속 ➔ 매도 압력 하락 / 거래량 0.8배 이하 완만 하락 ➔ 매수 공백
 하락.
 3. 수급 주체의 개입 조화: 상위 TF 추세 방향과 하위 TF 대량 거래량 주도 캔들 방향 일치 여부 판정.
-4. [수렴 패턴 방향 편향 승격 규칙] : 
+4. [수렴 패턴 방향 편향 승격 규칙] :
 삼각수렴/쐐기형이 확정된 상태에서 **종가 기준 이탈이 확정**된 경우에만, 해당 방향 편향 +0.10점을 S_1에 가산한다.
 (주관적 "이탈 임박" 판단 금지. 가산 비중은 정규화 후 최대 점수의 5%로 제한)
 5. 60분 미만 TF 노이즈 필터링 및 단독 입력 교정 규정: ◦ 60분 미만 TF는 상위 TF와 함께 수신될 경우 증거 집계 중 ②VSA

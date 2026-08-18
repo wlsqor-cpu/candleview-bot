@@ -523,10 +523,6 @@ def _spec_number(name, integer=False):
 DATA_MIN_COMPLETED_BARS = _spec_number("DATA_MIN_COMPLETED_BARS", integer=True)
 WEEKLY_HISTORY_DAYS = _spec_number("WEEKLY_HISTORY_DAYS", integer=True)
 OHLCV_STALE_INTERVALS = _spec_number("OHLCV_STALE_INTERVALS", integer=True)
-MODEL_ROSTER_TTL_HOURS = _spec_number("MODEL_ROSTER_TTL_HOURS", integer=True)
-MODEL_ROSTER_MIN_INPUT_TOKENS = _spec_number("MODEL_ROSTER_MIN_INPUT_TOKENS", integer=True)
-MODEL_ROSTER_MIN_OUTPUT_TOKENS = _spec_number("MODEL_ROSTER_MIN_OUTPUT_TOKENS", integer=True)
-MODEL_ROSTER_MAX_RETRY_RATE = _spec_number("MODEL_ROSTER_MAX_RETRY_RATE")
 
 
 def timeframe_seconds(tf):
@@ -1204,19 +1200,13 @@ def format_supplement_display(supplement, symbol, exchange_display):
 
 
 # ============================================================
-# 자동 모델 roster 운영 — 분석 수식·STAGE 0·Layer 5와 분리된 실행 인프라
+# 고정 승인 모델 운영 — 분석 수식·STAGE 0·Layer 5와 분리된 실행 인프라
 # ============================================================
-MODEL_ROSTER_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".candleview_model_roster.json")
-MODEL_ROSTER_LOCK = threading.Lock()
+# 자동 탐색·자동 승인·상태 캐시를 사용하지 않는다. 아래 순서는 수동 승인된 실행 순서다.
 STATIC_APPROVED_MODELS = [
-    # 실제 정상 실행이 확인된 고성능 Flash 두 개만 bootstrap으로 허용한다.
-    # Lite·preview·experimental 계열은 탐색·승인·실행 어느 단계에도 넣지 않는다.
-    {"model_id": "gemini-3.7-flash", "selection_source": "고성능 초기 roster", "rank": 0},
-    {"model_id": "gemini-3.6-flash", "selection_source": "고성능 fallback", "rank": 1},
+    {"model_id": "gemini-3.7-flash", "selection_source": "고정 승인 1차", "rank": 0},
+    {"model_id": "gemini-3.6-flash", "selection_source": "고정 승인 fallback", "rank": 1},
 ]
-MODEL_ROSTER_SCHEMA_VERSION = 3
-MODEL_ID_PATTERN = re.compile(r"^gemini-(\d+(?:\.\d+)+)-flash$")
-MODEL_EXCLUDED_TOKENS = ("preview", "experimental", "image", "live", "tts", "lite")
 
 
 def _model_url(model_id):
@@ -1246,7 +1236,7 @@ def format_model_provenance(metadata, python_only=False):
         label = "선택 실패" if kind == "model_selection" else "연결 실패"
         return f"분석 모델: {label}"
     model_id = metadata.get("model_id") or _model_id_from_url(metadata.get("model_url", ""))
-    suffix = "자동 fallback" if metadata.get("fallback_used") else metadata.get("selection_source", "승인 roster")
+    suffix = "자동 fallback" if metadata.get("fallback_used") else metadata.get("selection_source", "고정 승인 모델")
     safe_suffix = re.sub(r"[^가-힣A-Za-z0-9 ._-]", "", str(suffix))[:48] or "승인 roster"
     return f"분석 모델: {_friendly_model_name(model_id)} · {safe_suffix}"
 
@@ -1255,261 +1245,26 @@ def model_execution_hold_message(metadata):
     metadata = metadata or {}
     if metadata.get("failure_kind") == "model_selection":
         return ("⚠️ <b>분석 실행 보류</b>\n"
-                "현재 사용 가능한 Gemini 모델 중 CandleView 구조화 분석 조건을 충족한 후보를 확인하지 못했습니다.\n"
+                "현재 고정 승인 Gemini 모델 목록을 사용할 수 없습니다.\n"
                 "분석 결과는 생성되지 않았습니다. 잠시 후 동일 명령으로 다시 실행해 주세요.")
     return ("⚠️ <b>분석 실행 실패</b>\n"
             "현재 분석 모델에 연결할 수 없어 결과를 생성하지 않았습니다.\n"
             "시장 분석·가격 경로·투자 판단은 발행되지 않았습니다. 잠시 후 다시 실행해 주세요.")
 
 
-def _roster_default_state():
-    return {
-        "schema_version": MODEL_ROSTER_SCHEMA_VERSION,
-        "updated_at_utc": "",
-        "last_list_attempt_utc": "",
-        "approved": [dict(item) for item in STATIC_APPROVED_MODELS],
-        "discovered": [],
-    }
-
-
-def _load_model_roster_state():
-    try:
-        with open(MODEL_ROSTER_STATE_FILE, "r", encoding="utf-8") as fh:
-            state = json.load(fh)
-        if state.get("schema_version") != MODEL_ROSTER_SCHEMA_VERSION or not isinstance(state.get("approved"), list):
-            raise ValueError("roster schema invalid")
-        return state
-    except Exception:
-        return _roster_default_state()
-
-
-def _save_model_roster_state(state):
-    # tmp→replace로 부분 파일을 남기지 않는다. 실패하면 기존 마지막 성공 roster가 유지된다.
-    tmp_path = f"{MODEL_ROSTER_STATE_FILE}.tmp"
-    with open(tmp_path, "w", encoding="utf-8") as fh:
-        json.dump(state, fh, ensure_ascii=False, sort_keys=True)
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.replace(tmp_path, MODEL_ROSTER_STATE_FILE)
-
-
-def _roster_is_fresh(state, now):
-    try:
-        last = datetime.fromisoformat(state.get("last_list_attempt_utc", ""))
-        return now - last < timedelta(hours=MODEL_ROSTER_TTL_HOURS)
-    except Exception:
-        return False
-
-
-def _eligible_model_metadata(model):
-    """공식 models.list의 결정적 메타데이터만 사용해 호출 가능한 텍스트 Flash 후보를 분류한다."""
-    model_id = str(model.get("baseModelId") or model.get("name", "").replace("models/", ""))
-    lowered = model_id.lower()
-    if any(token in lowered for token in MODEL_EXCLUDED_TOKENS):
-        return None
-    if not MODEL_ID_PATTERN.fullmatch(model_id):
-        return None
-    methods = set(model.get("supportedGenerationMethods") or [])
-    if "generateContent" not in methods:
-        return None
-    if int(model.get("inputTokenLimit") or 0) < MODEL_ROSTER_MIN_INPUT_TOKENS:
-        return None
-    if int(model.get("outputTokenLimit") or 0) < MODEL_ROSTER_MIN_OUTPUT_TOKENS:
-        return None
-    return {
-        "model_id": model_id,
-        "input_token_limit": int(model.get("inputTokenLimit") or 0),
-        "output_token_limit": int(model.get("outputTokenLimit") or 0),
-        "version": str(model.get("version", "")),
-        "display_name": str(model.get("displayName", "")),
-    }
-
-
-def _fetch_eligible_model_candidates():
-    """목록 조회 실패는 분석 실패가 아니다. 호출자는 마지막 성공 roster를 유지한다."""
-    if not GEMINI_API_KEY:
-        raise RuntimeError("Gemini API key unavailable")
-    url = "https://generativelanguage.googleapis.com/v1beta/models"
-    page_token = None
-    eligible = []
-    while True:
-        params = {"pageSize": 1000}
-        if page_token:
-            params["pageToken"] = page_token
-        res = requests.get(url, headers={"X-goog-api-key": GEMINI_API_KEY}, params=params, timeout=20)
-        res.raise_for_status()
-        body = res.json()
-        for model in body.get("models", []):
-            candidate = _eligible_model_metadata(model)
-            if candidate:
-                eligible.append(candidate)
-        page_token = body.get("nextPageToken")
-        if not page_token:
-            break
-    return sorted(eligible, key=lambda item: item["model_id"])
-
-
-def _refresh_model_roster_if_due():
-    """신규 후보를 실제 fixture로 평가하고 비열화 금지 규칙을 통과한 경우에만 승인 roster를 원자 갱신한다."""
-    now = datetime.now(timezone.utc)
-    with MODEL_ROSTER_LOCK:
-        state = _load_model_roster_state()
-        if _roster_is_fresh(state, now):
-            return state
-        state["last_list_attempt_utc"] = now.isoformat()
-        try:
-            discovered = _fetch_eligible_model_candidates()
-            state["discovered"] = discovered
-            metrics = state.setdefault("metrics", {})
-            approved = state.setdefault("approved", [dict(item) for item in STATIC_APPROVED_MODELS])
-            # 현재 1차 모델도 후보와 동일 fixture로 한 번 평가해야 공정한 비열화 비교가 가능하다.
-            incumbent_id = str(sorted(approved, key=lambda row: int(row.get("rank", 9999)))[0].get("model_id", "")) if approved else ""
-            if incumbent_id and incumbent_id not in metrics:
-                metrics[incumbent_id] = _run_model_approval_fixture(incumbent_id)
-            incumbent_metrics = metrics.get(incumbent_id, {"hard_gate_pass": False})
-            approved_ids = {str(row.get("model_id", "")) for row in approved}
-            for candidate in discovered:
-                model_id = candidate["model_id"]
-                if model_id not in metrics:
-                    metrics[model_id] = _run_model_approval_fixture(model_id)
-                candidate_metrics = metrics[model_id]
-                if model_id == incumbent_id:
-                    continue
-                if model_candidate_dominates(candidate_metrics, incumbent_metrics):
-                    # 신규 우위 모델을 1차로 승격하고, 이전 1차는 즉시 fallback으로 보존한다.
-                    approved = [row for row in approved if str(row.get("model_id", "")) != model_id]
-                    approved.insert(0, {"model_id": model_id, "selection_source": "fixture 자동승격", "rank": 0})
-                    for rank, row in enumerate(approved):
-                        row["rank"] = rank
-                    state["approved"] = approved
-                    incumbent_id, incumbent_metrics = model_id, candidate_metrics
-                    approved_ids.add(model_id)
-                # 우위가 증명되지 않은 후보는 discovered·metrics 관측값으로만 남긴다.
-                # 승인 fallback을 누적하지 않아 분석 실행 후보는 항상 최대 2개로 제한한다.
-            state["approved"] = sorted(approved, key=lambda row: int(row.get("rank", 9999)))[:2]
-            for rank, row in enumerate(state["approved"]):
-                row["rank"] = rank
-            state["updated_at_utc"] = now.isoformat()
-        except Exception as exc:
-            state["last_list_error"] = type(exc).__name__
-        try:
-            _save_model_roster_state(state)
-        except Exception as exc:
-            print(f"[WARN] 모델 roster 저장 실패: {type(exc).__name__}")
-        return state
-
-
-MODEL_APPROVAL_FIXTURES = [
-    {
-        "name": "상방_반대근거",
-        "prompt": "고정 검증용 원천: S_1=+1.0, S_2=+0.5, S_3=-0.4, S_4=+0.2. 가격=100, P_entry=98, P_inv=94, P_target_1=105, P_target_2=110. RSI 일반 하락 다이버전스와 105 저항 매도벽이 있으므로 상방 조건부 경로와 반대근거를 함께 서술하라.",
-    },
-    {
-        "name": "하방_반대근거",
-        "prompt": "고정 검증용 원천: S_1=-1.0, S_2=-0.5, S_3=+0.4, S_4=-0.2. 가격=100, P_entry=102, P_inv=106, P_target_1=95, P_target_2=90. RSI 일반 상승 다이버전스와 95 매수벽이 있으므로 하방 조건부 경로와 반대근거를 함께 서술하라.",
-    },
-]
-
-
-def _median(values):
-    values = sorted(values)
-    if not values:
-        return 0.0
-    midpoint = len(values) // 2
-    return float(values[midpoint]) if len(values) % 2 else (values[midpoint - 1] + values[midpoint]) / 2.0
-
-
-def _run_model_approval_fixture(model_id):
-    """운영 API key가 있는 실행 환경에서만 후보를 실제 JSON 계약으로 평가한다."""
-    results = []
-    for fixture in MODEL_APPROVAL_FIXTURES:
-        prompt = (
-            "CandleView 승인 fixture입니다. 아래 원천만 사용해 JSON으로 응답하십시오. "
-            "user_briefing에는 1️⃣~6️⃣, RSI, 다만(반대근거), 조건부를 포함하십시오. "
-            "ledger에는 원천 점수·결론·가격경로·축 분류·Bundle을 완결하십시오.\n\n" + fixture["prompt"]
-        )
-        started = time.monotonic()
-        raw, meta = call_gemini_api_with_retry(
-            prompt, max_tokens=4096, preferred_url=_model_url(model_id), return_metadata=True,
-            response_json_schema=_load_phase2_response_schema(),
-        )
-        elapsed = time.monotonic() - started
-        rendered, warnings = render_phase2_structured_response(raw)
-        briefing = rendered.split(LEDGER_START, 1)[0] if rendered else ""
-        headings_ok = all(marker in briefing for marker in PHASE2_BOUNDARY_MARKERS)
-        coverage_ok = all(token in briefing for token in ("RSI", "다만", "조건부"))
-        verification_ok = bool(rendered) and not warnings and "[자동검증 로그" not in verify_and_fix_phase2(rendered)
-        results.append({
-            "fixture": fixture["name"], "ok": not meta.get("failed") and headings_ok and coverage_ok and verification_ok,
-            "coverage": 1.0 if coverage_ok else 0.0,
-            "retry": 0.0 if not meta.get("failed") else 1.0,
-            "tokens": float(meta.get("total_token_count", 0) or 0), "latency": elapsed,
-        })
-    hard_gate = bool(results) and all(row["ok"] for row in results)
-    return {
-        "hard_gate_pass": hard_gate,
-        "quality_rate": sum(row["coverage"] for row in results) / len(results) if results else 0.0,
-        "coverage_rate": sum(row["coverage"] for row in results) / len(results) if results else 0.0,
-        "retry_rate": sum(row["retry"] for row in results) / len(results) if results else 1.0,
-        "median_total_tokens": _median([row["tokens"] for row in results]),
-        "median_latency_seconds": _median([row["latency"] for row in results]),
-        "fixture_results": results,
-        "tested_at_utc": datetime.now(timezone.utc).isoformat(),
-    }
-
-
-def model_candidate_dominates(challenger, incumbent):
-    """승격은 CandleView 품질·논리 무결성으로만 판정한다.
-    토큰·지연은 운영 비용 관측값이며 상위 모델의 자동 승격을 차단하지 않는다."""
-    required = ("hard_gate_pass", "quality_rate", "retry_rate")
-    if not all(key in challenger and key in incumbent for key in required):
-        return False
-    if not challenger["hard_gate_pass"] or challenger["retry_rate"] > MODEL_ROSTER_MAX_RETRY_RATE:
-        return False
-    if not incumbent["hard_gate_pass"]:
-        return True
-    return (
-        challenger["quality_rate"] >= incumbent["quality_rate"]
-        and challenger["retry_rate"] <= incumbent["retry_rate"]
-        and (
-            challenger["quality_rate"] > incumbent["quality_rate"]
-            or challenger["retry_rate"] < incumbent["retry_rate"]
-        )
-    )
-
-
-def _execution_eligible_model_id(model_id):
-    lowered = str(model_id or "").lower()
-    return bool(MODEL_ID_PATTERN.fullmatch(str(model_id or "")) and not any(token in lowered for token in MODEL_EXCLUDED_TOKENS))
-
-
 def get_approved_model_roster():
-    """분석 요청은 저장된 고성능 승인 roster만 즉시 사용한다.
-    TTL 후보 검토는 성공 분석 뒤 별도 실행되며 정상 분석 시작을 지연시키지 않는다."""
-    state = _load_model_roster_state()
-    approved = [item for item in state.get("approved", []) if _execution_eligible_model_id(item.get("model_id", ""))]
-    if not approved:
-        approved = [dict(item) for item in STATIC_APPROVED_MODELS]
+    """분석 실행에는 수동 승인된 두 고정 모델만 순서대로 사용한다.
+    모델 목록 탐색·상태 캐시·fixture 호출은 일반 분석 경로에 존재하지 않는다."""
     selected = []
-    for item in sorted(approved, key=lambda row: (int(row.get("rank", 9999)), str(row.get("model_id", ""))))[:2]:
-        model_id = str(item.get("model_id", ""))
+    for item in sorted(STATIC_APPROVED_MODELS, key=lambda row: (int(row["rank"]), row["model_id"])):
+        model_id = item["model_id"]
         selected.append({
             "model_id": model_id,
             "model_url": _model_url(model_id),
-            "selection_source": str(item.get("selection_source", "승인 roster")),
-            "roster_updated_at_utc": state.get("updated_at_utc", ""),
+            "selection_source": item["selection_source"],
+            "roster_updated_at_utc": "fixed-static",
         })
     return selected
-
-
-def refresh_model_roster_after_success():
-    """분석 응답 뒤 TTL 후보 검토를 비동기로 수행한다. 오류는 다음 분석 실행에 영향을 주지 않는다."""
-    def _safe_refresh():
-        try:
-            _refresh_model_roster_if_due()
-        except Exception as exc:
-            print(f"[WARN] 모델 roster 사후 검토 실패: {type(exc).__name__}")
-    threading.Thread(target=_safe_refresh, daemon=True).start()
 
 
 # ============================================================
@@ -1544,6 +1299,8 @@ def call_gemini_api_with_retry(full_prompt, max_tokens=16384, preferred_url=None
         failure_metadata = {"model_url": "", "response_model_version": "", "failed": True, "failure_kind": "model_selection"}
         return (failure_text, failure_metadata) if return_metadata else failure_text
 
+    last_failure_kind = "model_call"
+    last_retry_after_seconds = None
     for candidate in candidates:
         url = candidate["model_url"]
         for _ in range(2):
@@ -1573,31 +1330,45 @@ def call_gemini_api_with_retry(full_prompt, max_tokens=16384, preferred_url=None
                             "model_url": url,
                             "model_id": candidate.get("model_id") or _model_id_from_url(url),
                             "response_model_version": data.get("modelVersion", ""),
-                            "selection_source": candidate.get("selection_source", "승인 roster"),
+                            "selection_source": candidate.get("selection_source", "고정 승인 모델"),
                             "roster_updated_at_utc": candidate.get("roster_updated_at_utc", ""),
                             "fallback_used": candidate is not candidates[0],
                             "prompt_token_count": int(usage.get("promptTokenCount", 0) or 0),
                             "output_token_count": int(usage.get("candidatesTokenCount", 0) or 0),
                             "total_token_count": int(usage.get("totalTokenCount", 0) or 0),
                         }
-                        # 분석 성공 뒤에만 후보 roster를 비동기 검토한다.
-                        # 현재 요청의 모델 선택·응답·지연에는 영향을 주지 않는다.
-                        if preferred_url is None:
-                            refresh_model_roster_after_success()
                         return (answer_text, metadata) if return_metadata else answer_text
                     # 사고과정만 오고 최종 답변 파트가 비어있는 경우(토큰 예산 소진 등) 재시도로 넘긴다
                     print(f"[WARN] Gemini 응답에 최종 답변 파트 없음(사고과정만 수신, parts={len(parts)}개), 재시도")
                     time.sleep(1)
+                elif res.status_code == 429:
+                    # 일·분 단위 할당량은 즉시 같은 요청을 재시도해도 회복되지 않을 수 있다.
+                    # PHASE 2는 PHASE 1 모델 고정 계약을 지키므로 다른 모델로 전환하지 않는다.
+                    last_failure_kind = "quota_exhausted"
+                    try:
+                        detail = res.json()
+                        retry_info = next((item for item in detail.get("error", {}).get("details", [])
+                                           if item.get("@type", "").endswith("RetryInfo")), {})
+                        delay_text = str(retry_info.get("retryDelay", "")).rstrip("s")
+                        last_retry_after_seconds = int(float(delay_text)) if delay_text else None
+                    except Exception:
+                        pass
+                    print("[WARN] Gemini 할당량 제한(429): PHASE 2 모델 고정 계약에 따라 fallback 없이 보류")
+                    break
                 elif res.status_code == 503:
+                    last_failure_kind = "service_unavailable"
                     time.sleep(3)
                 else:
+                    last_failure_kind = f"http_{res.status_code}"
                     print(f"[WARN] Gemini 응답 코드: {res.status_code}")
                     time.sleep(1)
             except Exception as e:
+                last_failure_kind = "network_exception"
                 print(f"[WARN] Gemini 호출 예외: {e}")
                 time.sleep(2)
     failure_text = "AI 서버 일시적 과부하 또는 모델 접근 불가 상태입니다. 잠시 후 다시 시도해 주세요."
-    failure_metadata = {"model_url": preferred_url or "", "response_model_version": "", "failed": True, "failure_kind": "model_call"}
+    failure_metadata = {"model_url": preferred_url or "", "response_model_version": "", "failed": True,
+                        "failure_kind": last_failure_kind, "retry_after_seconds": last_retry_after_seconds}
     return (failure_text, failure_metadata) if return_metadata else failure_text
 
 
@@ -2369,6 +2140,10 @@ def run_phase2(phase1_result, symbol, exchange_name, phase1_canonical=None, phas
             response_json_schema=_load_phase2_response_schema(),
         )
         if response_meta.get("failed"):
+            if response_meta.get("failure_kind") == "quota_exhausted":
+                wait_seconds = response_meta.get("retry_after_seconds")
+                wait_hint = f" 약 {wait_seconds}초 후" if wait_seconds else " 잠시 후"
+                return "[검증보류 — PHASE 2 고정 모델 할당량 도달]" + wait_hint + " 동일 명령으로 다시 분석해 주세요."
             return "[검증보류 — PHASE 2 고정 모델 호출 실패]"
         raw_result, structured_warnings = render_phase2_structured_response(raw_json)
         if structured_warnings:
