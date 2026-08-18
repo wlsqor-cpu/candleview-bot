@@ -660,7 +660,7 @@ STAGE 0 자체가 요구하는 관찰·분류 작업(예: 박스권 판정식, �
 (PHASE 1 최종 종료): "API 데이터 수집 및 캐싱이 완료되었습니다. 이 데이터를 바탕으로 세력의 수급 의도와 프라이스 액션
 진단 및 최종 실행 전략(PHASE 2)을 진행할까요?"
 
-3. [STAGE 0 원천 데이터 적격성 게이트 — V006]: 각 TF의 OHLCV 수신 직후 timestamp 단조증가·중복·기대 TF 간격 결손·OHLCV 유한성·고저가 논리·음수 거래량·완성봉 수·최신성을 검증하고, 거래소/TF별 수집 시작·완료 UTC 시각과 마지막 원천봉 시각을 기록한다. 모든 수집 호출의 최대 시간차가 선택 TF 중 최단 TF의 1개 구간 이상이면 [시간비동기]로 기록한다. DATA_MIN_COMPLETED_BARS는 표준 수집 목표이며, 거래 시작 후 확보 가능한 정상·연속·최신 완성봉은 수가 목표보다 적어도 전량을 동일 분석 입력으로 사용한다. 빈 배열, timestamp 중복·역행, 기대 TF 간격 결손, 비유한값, OHLC 논리 오류, 음수 거래량 또는 최신성 결손이 있으면 해당 TF는 [데이터결손/판정불가]다. 실제 결손 TF는 PHASE 1 카드의 항목을 생략하지 않되 해당 판정 의존 항목을 [데이터결손/판정불가]로 기록하며, OHLCV·RSI·캔들·다이버전스·구조·VSA·가격경로의 근거로 사용하지 않는다. Volume Delta·OI·Whale Wall은 OHLCV 봉수와 독립된 각 원천의 가용성·무결성 규칙을 적용한다. 값은 Layer 1 상수 및 TF 분 단위 매핑표에서만 참조하며, 이 게이트는 전역 점수·가격 산식·기존 상수를 변경하지 않는다.
+3. [STAGE 0 원천 데이터 적격성 게이트 — V006]: 각 직접 수신 TF의 OHLCV 수신 직후 timestamp 단조증가·중복·기대 TF 간격 결손·OHLCV 유한성·고저가 논리·음수 거래량·완성봉 수·최신성을 검증하고, 거래소/TF별 수집 시작·완료 UTC 시각과 마지막 원천봉 시각을 기록한다. 모든 수집 호출의 최대 시간차가 선택 TF 중 최단 TF의 1개 구간 이상이면 [시간비동기]로 기록한다. DATA_MIN_COMPLETED_BARS는 표준 수집 목표이며, 거래 시작 후 확보 가능한 정상·연속·최신 완성봉은 수가 목표보다 적어도 전량을 동일 분석 입력으로 사용한다. 빈 배열, timestamp 중복·역행, 기대 TF 간격 결손, 비유한값, OHLC 논리 오류, 음수 거래량 또는 최신성 결손이 있으면 해당 TF는 [데이터결손/판정불가]다. 실제 결손 TF는 PHASE 1 카드의 항목을 생략하지 않되 해당 판정 의존 항목을 [데이터결손/판정불가]로 기록하며, OHLCV·RSI·캔들·다이버전스·구조·VSA·가격경로의 근거로 사용하지 않는다. Volume Delta·OI·Whale Wall은 OHLCV 봉수와 독립된 각 원천의 가용성·무결성 규칙을 적용한다. 주봉을 일봉에서 파생할 때는 먼저 원천 일봉에 같은 적격성 게이트를 적용하고, 일봉 결손은 주봉에 승계한다. 수집 시작으로 생긴 첫 부분 주는 집계에서 제외하되 마지막 부분 주는 진행봉으로만 유지한다. 값은 Layer 1 상수 및 TF 분 단위 매핑표에서만 참조하며, 이 게이트는 전역 점수·가격 산식·기존 상수를 변경하지 않는다.
 
 4. PHASE 2는 사용자가 PHASE 1 종료 고정 문구에 명시적으로 승인한 후에만 실행하며, 승인 전에는 해석 관련 서술을 일절
 금지한다. ◦ PHASE 2 (통합 브리핑 완제): 사용자의 명시적 승인 후 1️⃣ 메인 시나리오 및 예상 소요기간(P_entry,
@@ -1563,7 +1563,7 @@ D_final = D_net
 
 
 ※ [대형 임펄스 예외 규칙]: 직전 완성 임펄스의 SH-SL 폭이 해당 임펄스 시작가 대비 70% 이상이고, 그 임펄스 종료 이후 발생한
-최초 1회의 반전 신호(스프링/UTAD/정식 CHoCH)가 유효로 확정된 경우, 우세 등급을 1단계 상향한다(횡보➔보통, 보통➔강). 변곡
+최초 1회의 반전 신호(스프링/UTAD/정식 CHoCH)가 유효로 확정된 경우, 이미 방향이 확정되고 기본 우세 등급이 보통인 경우에만 강으로 1단계 상향한다. 횡보는 방향성 등급을 새로 만들지 않으며 약함은 보통으로 상향하지 않는다. 변곡
 진단 레이어와의 중복 상향은 최대 1단계로 제한한다.
 
 ▶ [메인 시나리오 확률% 산출 공식]: • 근거강도 =
@@ -1945,18 +1945,18 @@ VOL_AVG_LOOKBACK, ROLE_REVERSAL_TOLERANCE, RSI_DELTA_MIN, EPSILON 등)는 Candle
 • MIN_BARS_STANDARD = 40         # 표준 분석 최소 봉수 [판정47번: 20→40, 근거는 판정이력 참조]
 • MIN_BARS_REDUCED = 8           # 축소 룩백 분석 최소 봉수 (미만 시 관측대기)
 • NEWCOIN_CONFIDENCE = 0.80      # 신규·데이터축소 코인 S_scout 신뢰도 계수
-• S_SCOUT_W_VOLSQUEEZE = 0.18    # 미시모듈 가중치 — 변동성 응축 (V003[C] Cowork 재설계 갱신)
-• S_SCOUT_W_TAKERBUY  = 0.16     # 미시모듈 가중치 — 체결강도 (V003[C] Cowork 재설계 갱신)
-• S_SCOUT_W_DEPTH     = 0.10     # 미시모듈 가중치 — 호가 비대칭 (V003[C] Cowork 재설계 갱신)
-• S_SCOUT_W_ABSORPTION = 0.24    # 미시모듈 가중치 — 수급 흡수 (V003[C] Cowork 재설계 갱신)
-• S_SCOUT_W_STRUCTURE = 0.14     # 미시모듈 가중치 — 구조 임계 (V003[C] Cowork 재설계 갱신)
-• S_SCOUT_W_VOLACCEL = 0.09      # 미시모듈 가중치 — 거래량 가속도 (V003[C] Cowork 재설계 갱신)
-• S_SCOUT_W_RELSTRENGTH = 0.09   # 미시모듈 가중치 — 상대강도 BTC 대비 (V003[C] Cowork 재설계 갱신)
-  (7대 가중치 합 = 1.00 고정 불변. [V003[C] Cowork 재설계, 판정이력45번] 변동성응축·수급흡수
-  비중을 상향하고 체결강도·호가비대칭·가속도·상대강도를 소폭 하향 — "조용하지만 수급이
-  받쳐주는" 흡수 구간에 랭킹 우선순위를 주기 위함. 하드 게이트가 아니라 FC-1 통과 후보
-  사이의 랭킹 선호일 뿐이므로 고변동 후보를 배제하지 않는다. 거래소 미지원 시 재정규화
-  가중치는 이 표준값을 (1-S_SCOUT_W_TAKERBUY)로 나눠 산출한다 — 5.[FC-3] 참조.)
+• S_SCOUT_W_VOLSQUEEZE = 0.1638  # 8모듈 표준 가중치 — 변동성 응축
+• S_SCOUT_W_TAKERBUY  = 0.1456  # 8모듈 표준 가중치 — 체결강도
+• S_SCOUT_W_DEPTH     = 0.0910  # 8모듈 표준 가중치 — 호가 비대칭
+• S_SCOUT_W_ABSORPTION = 0.2184 # 8모듈 표준 가중치 — 수급 흡수
+• S_SCOUT_W_STRUCTURE = 0.1274 # 8모듈 표준 가중치 — 구조 임계
+• S_SCOUT_W_VOLACCEL = 0.0819  # 8모듈 표준 가중치 — 거래량 가속도
+• S_SCOUT_W_RELSTRENGTH = 0.0819 # 8모듈 표준 가중치 — 상대강도 BTC 대비
+• S_SCOUT_W_BOXRANGE = 0.0900  # 8모듈 표준 가중치 — 박스권 접촉 구조
+• S_SCOUT_W_NO_TAKER_DENOM = 0.8544  # = 1 - S_SCOUT_W_TAKERBUY
+  (8대 가중치 합 = 1.0000 고정 불변. 체결강도 미지원 시 W_taker=0으로 제외하고,
+  나머지 모듈의 적용 가중치는 각각 해당 S_SCOUT_W_* / S_SCOUT_W_NO_TAKER_DENOM으로 도출한다.
+  표준·재정규화 값은 이 상수에서만 계산하며 별도 숫자표를 정의하지 않는다.)
 • VROC_ACCEL_MIN = 1.0           # 거래량 가속도(VROC) 비율 하한 — 이하 시 가속 없음(0점)
 • VROC_ACCEL_MAX = 2.0           # 거래량 가속도(VROC) 비율 상한 — 이상 시 만점(기존 모듈2
   체결강도의 '2배 임계 = 만점' 관행을 그대로 준용, 신규 임의 임계 도입 회피)
@@ -2279,25 +2279,15 @@ State 2(거래량 급증 돌파 초입) > State 3(상위 추세 중 눌림목) >
   양쪽 밴드를 스치는 경우 이론상 오확정 여지가 남는다. 이후 재검토 요청 시 재검증 대상
   ([해석] 등급).
 
-[S_scout 집계 공식] — 판정52번 8모듈 구조로 갱신
-  [분기] 모듈2(체결강도) 가용 시(표준 가중치): 모듈2 [거래소 미지원] 시(재정규화 가중치, FC-3
-  모듈2 정의 참조):
-  가중합 = (S_vol_squeeze × W_vol) + (S_taker_buy × W_taker) + (S_depth × W_depth)
-         + (S_absorption × W_absorb) + (S_structure × W_struct)
-         + (S_vol_accel × W_volaccel) + (S_relstrength × W_relstrength)
-         + (S_boxrange × W_boxrange)
-  [판정52번 갱신] 표준(8모듈): W_vol=0.1638, W_taker=0.1456, W_depth=0.091, W_absorb=0.2184,
-  W_struct=0.1274, W_volaccel=0.0819, W_relstrength=0.0819, W_boxrange=0.09, 합=1.0
-  (기존 7모듈 가중치에 (1-W_boxrange)=0.91을 균등 곱해 비례축소하고 W_boxrange=0.09를 신설
-  추가 — 개별 모듈간 기존 상대비율은 그대로 보존됨. W_boxrange=0.09는 시뮬레이션으로
-  역산한 값이 아니라, 기존 최하위 우선순위 티어(W_volaccel·W_relstrength, 둘 다 0.09)와
-  동일하게 맞춘 것 — 검증되지 않은 신규 신호에 최저 우선순위를 부여한다는 명시적 원칙에
-  따른 값이며, 실효성이 추후 검증되면 조정 대상.)
-  (거래소 미지원 시: W_taker=0(모듈2 자체를 가중합에서 제외), 나머지 7개 모듈은 위 표준
-  가중치를 (1 - W_taker(0.1456)) = 0.8544로 나눠 비례확대 재정규화한다 — W_vol=0.1917,
-  W_depth=0.1065, W_absorb=0.2556, W_struct=0.1491, W_volaccel=0.0959,
-  W_relstrength=0.0959, W_boxrange=0.1053, 합=1.0. 표준·재정규화 두 세트가 항상 같은
-  원본에서 파생되도록 유지하는 기존 산출법을 그대로 계승.)
+[S_scout 집계 공식] — Layer 1 FindCoin 전용 상수만 참조
+  [분기] 모듈2(체결강도) 가용 시에는 Layer 1의 S_SCOUT_W_* 8개를 그대로 사용한다.
+  모듈2가 [거래소 미지원]이면 S_SCOUT_W_TAKERBUY=0으로 제외하고, 나머지 7개 적용 가중치는
+  각각 S_SCOUT_W_* / S_SCOUT_W_NO_TAKER_DENOM으로 도출한다.
+  가중합 = (S_vol_squeeze × S_SCOUT_W_VOLSQUEEZE) + (S_taker_buy × S_SCOUT_W_TAKERBUY)
+         + (S_depth × S_SCOUT_W_DEPTH) + (S_absorption × S_SCOUT_W_ABSORPTION)
+         + (S_structure × S_SCOUT_W_STRUCTURE) + (S_vol_accel × S_SCOUT_W_VOLACCEL)
+         + (S_relstrength × S_SCOUT_W_RELSTRENGTH) + (S_boxrange × S_SCOUT_W_BOXRANGE)
+  표준·미지원 분기 모두 Layer 1 상수와 도출식만 사용하며, 이 절에는 별도 가중치 숫자표를 두지 않는다.
   S_scout = 가중합 × 10 × (신뢰도 계수)
   • 신뢰도 계수 = 1.0(표준 분석) 또는 NEWCOIN_CONFIDENCE(0.80, 신규·데이터축소).
   • 이론적 범위: [0, 10]. 두 경우 모두 가중치 합이 1.0이므로 가중합은 [0,1], ×10으로 [0,10] 보장—
@@ -2370,8 +2360,8 @@ FindCoin은 진입가·무효화가를 새로 발명하지 않고 CandleView_API
 총 스캔 종목: N_total개 (유효 N_valid개 / 관측대기 N_wait개)
 
 🧭 스캔 단계별 통과
-➔ 1차 수급·유동성 N_gate1개
-➔ State 옥석 N_gate2개
+➔ 1차 경로 통과 N_gate1개
+➔ 상세 판정 후보 N_gate2개
 ➔ 최종 합격 N_pass개
 
 ✅️ 시장 상태 : (알트 순환매 강세 / 변동성 응축 / 관망 국면)

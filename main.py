@@ -128,6 +128,40 @@ def resolve_exchange(name: str):
         return key
     return None
 
+
+# 수동 TF는 엔진 명세의 분 단위 표준표로 한 번만 정규화한다.
+# 기본 TF는 이미 같은 표준표의 부분집합이므로 동일 함수를 거쳐도 값이 변하지 않는다.
+TF_STANDARD_MINUTES = {
+    "1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30,
+    "1h": 60, "2h": 120, "4h": 240, "6h": 360, "8h": 480,
+    "12h": 720, "1d": 1440, "3d": 4320, "1w": 10080, "1M": 43200,
+}
+
+
+def normalize_timeframes(raw_tfs):
+    """수동 TF를 상위 표준 TF로 수렴·중복제거·내림차순 정렬한다.
+    반환: (정규화 목록, 오류 메시지). 표준표 초과값은 임의 축소하지 않고 거부한다."""
+    if not isinstance(raw_tfs, (list, tuple)):
+        return None, "시간대(TF) 입력 형식이 올바르지 않습니다."
+    normalized = []
+    for raw_tf in raw_tfs:
+        token = str(raw_tf).strip()
+        match = re.fullmatch(r"(\d+)(m|h|d|w|M)", token)
+        if not match or int(match.group(1)) <= 0:
+            return None, f"지원하지 않는 시간대(TF)입니다: {token}"
+        number, unit = int(match.group(1)), match.group(2)
+        raw_minutes = number * {"m": 1, "h": 60, "d": 1440, "w": 10080, "M": 43200}[unit]
+        upper = [name for name, minutes in TF_STANDARD_MINUTES.items() if minutes >= raw_minutes]
+        if not upper:
+            return None, f"표준 범위를 초과하는 시간대(TF)입니다: {token}"
+        canonical = min(upper, key=lambda name: TF_STANDARD_MINUTES[name])
+        if canonical not in normalized:
+            normalized.append(canonical)
+    if not (2 <= len(normalized) <= 4):
+        return None, "시간대(TF)는 중복 제거 후 최소 2개, 최대 4개를 지정해 주세요."
+    normalized.sort(key=lambda name: TF_STANDARD_MINUTES[name], reverse=True)
+    return normalized, None
+
 # ============================================================
 # Render 포트 바인딩 (헬스체크용)
 # ============================================================
@@ -496,12 +530,18 @@ MODEL_ROSTER_MAX_RETRY_RATE = _spec_number("MODEL_ROSTER_MAX_RETRY_RATE")
 
 
 def timeframe_seconds(tf):
-    """기존 CandleView TF 문자열에서 직접 구간 초를 유도한다. 미지원 형식은 None."""
-    match = re.fullmatch(r"(\d+)(m|h|d|w)", tf or "")
+    """TF의 대표 구간 초를 반환한다. 월봉은 최신성 계산용 30일 대표값만 사용한다."""
+    match = re.fullmatch(r"(\d+)(m|h|d|w|M)", tf or "")
     if not match:
         return None
     value, unit = int(match.group(1)), match.group(2)
-    return value * {"m": 60, "h": 3600, "d": 86400, "w": 604800}[unit]
+    return value * {"m": 60, "h": 3600, "d": 86400, "w": 604800, "M": 2592000}[unit]
+
+
+def _calendar_month_delta(timestamp_a_ms, timestamp_b_ms):
+    a = datetime.fromtimestamp(timestamp_a_ms / 1000, timezone.utc)
+    b = datetime.fromtimestamp(timestamp_b_ms / 1000, timezone.utc)
+    return (b.year - a.year) * 12 + (b.month - a.month)
 
 
 def validate_ohlcv_quality(ohlcv, tf, collected_at_utc):
@@ -543,7 +583,14 @@ def validate_ohlcv_quality(ohlcv, tf, collected_at_utc):
     if np.any(diffs <= 0):
         reasons.append("timestamp 중복 또는 역행")
     expected_ms = expected_seconds * 1000
-    if len(diffs) and np.any(diffs != expected_ms):
+    if tf.endswith("M"):
+        expected_months = int(tf[:-1])
+        if len(timestamps) > 1 and any(
+            _calendar_month_delta(timestamps[i - 1], timestamps[i]) != expected_months
+            for i in range(1, len(timestamps))
+        ):
+            reasons.append("기대 월봉 캘린더 간격 결손 또는 불일치")
+    elif len(diffs) and np.any(diffs != expected_ms):
         reasons.append("기대 TF 간격 결손 또는 불일치")
     if (numeric["volume"] < 0).any():
         reasons.append("음수 거래량 존재")
@@ -623,6 +670,10 @@ def resample_daily_to_weekly(ohlcv_1d):
     weekly = df.resample("W-MON", label="left", closed="left").agg({
         "open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum",
     }).dropna()
+    source_days = df["close"].resample("W-MON", label="left", closed="left").count()
+    # 수집 시작점이 주중이면 첫 버킷은 7일을 대표하지 못한다. 마지막 버킷은 진행 주봉으로 유지한다.
+    if not weekly.empty and source_days.loc[weekly.index[0]] < 7:
+        weekly = weekly.iloc[1:]
     if weekly.empty:
         return []
     weekly["timestamp"] = weekly.index.map(lambda x: int(x.timestamp() * 1000))
@@ -737,7 +788,7 @@ def fetch_volume_delta_summary(exchange, symbol, timeframe, limit=120):
     # 비활성 처리를 규정하는데, 기존 코드는 이 예외를 두지 않고 아래 제네릭 체결근사 분기로
     # 빠져 신뢰할 수 없는 근사값을 "정상(status=ok)"으로 그대로 내보내고 있었다(실사용에서
     # 효과가 기대에 못 미친다는 지적으로 확인됨). 여기서 명시적으로 조기 반환한다.
-    if ex_id in ("upbit", "bithumb"):
+    if ex_id not in ("binance", "binanceusdm", "binancecoinm"):
         return None
 
     try:
@@ -1654,6 +1705,10 @@ def answer_callback_query(callback_query_id, text=None):
 def run_phase1(symbol_input, exchange_name, custom_tfs):
     ex_name = resolve_exchange(exchange_name)
     ex_display = SUPPORTED_EXCHANGES.get(ex_name, {}).get("kr_name", exchange_name)
+    normalized_tfs, tf_error = normalize_timeframes(custom_tfs)
+    if tf_error:
+        return tf_error, None, None, None
+    custom_tfs = normalized_tfs
     try:
         if ex_name is None:
             return (
@@ -1724,11 +1779,17 @@ def run_phase1(symbol_input, exchange_name, custom_tfs):
                 if WEEKLY_HISTORY_DAYS is None:
                     raise RuntimeError("WEEKLY_HISTORY_DAYS SSOT를 읽지 못해 주봉 수집을 시작할 수 없습니다")
                 daily_ohlcv = exchange_class.fetch_ohlcv(symbol, timeframe="1d", limit=WEEKLY_HISTORY_DAYS)
+                tf_fetch_finished = datetime.now(timezone.utc)
+                daily_quality = validate_ohlcv_quality(daily_ohlcv, "1d", tf_fetch_finished)
                 ohlcv = resample_daily_to_weekly(daily_ohlcv)
             else:
+                daily_quality = None
                 ohlcv = exchange_class.fetch_ohlcv(symbol, timeframe=tf, limit=120)
-            tf_fetch_finished = datetime.now(timezone.utc)
+                tf_fetch_finished = datetime.now(timezone.utc)
             quality = validate_ohlcv_quality(ohlcv, tf, tf_fetch_finished)
+            if daily_quality and daily_quality["status"] == "데이터결손/판정불가":
+                quality["status"] = "데이터결손/판정불가"
+                quality["reasons"].append("주봉 파생 원천 1d " + "; ".join(daily_quality["reasons"]))
             quality["fetch_started_utc"] = tf_fetch_started.isoformat(timespec="seconds") + "Z"
             quality["fetch_finished_utc"] = tf_fetch_finished.isoformat(timespec="seconds") + "Z"
             tf_quality_list.append(quality)
@@ -2819,8 +2880,8 @@ def run_findcoin_scan(ex_name):
     # 경로B는 이미 압축도 오름차순으로 정렬된 상태에서 순회했으므로 결과 순서도 유지된다.
 
     # [V003[C] 후보 상한 배분] 경로A 우선, 잔여 슬롯만 경로B
-    final_candidates = path_a_final + path_b_final
-    n_gate2 = len(final_candidates)
+    final_candidates = (path_a_final + path_b_final)[:FC_MAX_CANDIDATES_TO_LLM]
+    n_gate2 = len(final_candidates)  # 실제 LLM 상세 판정 입력 수와 동일
 
     return final_candidates, n_total, n_valid, n_gate1, n_gate2, watch_only
 
@@ -2985,10 +3046,11 @@ def run_findcoin(ex_name):
         f"대상 거래소: {ex_display} ({quote} 마켓)\n"
         f"총 스캔 종목(N_total): {n_total}개\n"
         f"유효 종목(N_valid, 사전정제 통과): {n_valid}개\n"
-        f"1차 통과(경로A∪경로B 합산, N_gate1): {n_gate1}개\n"
-        f"최종 통과(유동성까지, N_gate2): {n_gate2}개\n\n"
+        f"1차 경로 통과(경로A∪경로B 수식 게이트, N_gate1): {n_gate1}개\n"
+        f"상세 판정 후보(유동성 통과 후 실제 LLM 입력, N_gate2): {n_gate2}개\n\n"
         f"{candidate_payload}\n\n"
-        f"위 후보 각각에 FC-2(State 자동진단 및 우선순위 2>3>1) → FC-3(7대 미시모듈 및 S_scout 집계) "
+        f"위 후보 각각에 FC-2(State 자동진단 및 우선순위 2>3>1) → FC-3(8대 미시모듈 및 S_scout 집계; "
+        f"S_boxrange를 포함하고 FindCoin 전용 상수의 8모듈 가중치만 사용) "
         f"→ FC-4(진입가·손익비, 본체 정의 상속) → FC-5(이중게이트 통과판정) 순서로 적용하고, "
         f"FC-6의 고정 출력 서식대로 최종 결과를 완제 출력하십시오. 각 후보 표기의 [경로A]/[경로B]는 "
         f"어느 진입경로로 후보에 포함됐는지를 나타내며, [경로B]는 RTM·Percentile 요건이 면제된 State1 "
@@ -3320,9 +3382,10 @@ while True:
                         f"대상 : {ex_display_fc} {quote} 마켓\n"
                         f"스캔 시각: {scan_time_kst_watch} (KST)\n"
                         f"총 스캔 종목: {n_total}개 (유효 {n_valid}개 / 관측대기 {n_watch}개)\n\n"
-                        f"🧭 스캔 단계별 통과\n"
-                        f"➔ 1차 수급 {n_gate1}개\n"
-                        f"➔ 최종 합격 {n_gate2}개\n\n"
+                        f"🧭 스캔 단계별 현황\n"
+                        f"➔ 1차 경로 통과 {n_gate1}개\n"
+                        f"➔ 상세 판정 후보 {n_gate2}개\n"
+                        f"➔ 최종 합격 0개\n\n"
                         f"✅️ 시장 상태 : 관망 국면\n\n"
                         f"[관망 권고] 현재 {ex_display_fc} {quote} 마켓 내 경로A(Percentile ≥ 85% AND "
                         f"RTM ≥ 3.0 AND Liquidity_Ratio ≥ 1.0) 및 경로B(변동폭 ≤ 5.0% AND "
@@ -3347,10 +3410,13 @@ while True:
                 continue
 
             sym_name = parts[1]
-            # TF 미지정 시 거래소 유형별 고정값 자동 적용, 지정 시 그대로 사용
+            # TF 미지정 시 거래소 유형별 고정값 자동 적용, 수동 입력은 명세 표준으로 정규화한다.
             if len(parts) > 2:
-                tfs = parts[2:]
-                tf_note = "(직접 지정)"
+                tfs, tf_error = normalize_timeframes(parts[2:])
+                if tf_error:
+                    send_telegram_message(chat_id, tf_error)
+                    continue
+                tf_note = "(직접 지정·표준화)"
             else:
                 tfs = list(SUPPORTED_EXCHANGES[ex_name]["default_tfs"])
                 tf_note = "(자동 적용)"
