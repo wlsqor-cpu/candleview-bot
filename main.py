@@ -228,32 +228,6 @@ if not CANDLEVIEW_PROMPT_FULL:
     CANDLEVIEW_PROMPT_FULL = "CandleView 정밀 연산 엔진"
     print("[WARN] 엔진 파일을 찾지 못해 기본 문자열로 대체합니다.")
 
-
-PHASE2_CONTRACT_START = "=== [PHASE2_EXECUTION_CONTRACT_START] ==="
-PHASE2_CONTRACT_END = "=== [PHASE2_EXECUTION_CONTRACT_END] ==="
-
-
-def _load_phase2_execution_contract():
-    """명세의 PHASE 2 전용 계약만 추출한다.
-
-    전체 엔진 명세를 PHASE 2에 재주입하지 않는다. 표식 누락·중복·공백은
-    구형/손상 명세가 의도치 않게 전체 프롬프트로 실행되는 것을 막기 위해
-    명시적 검증보류로 처리한다.
-    """
-    if CANDLEVIEW_PROMPT_FULL.count(PHASE2_CONTRACT_START) != 1 or CANDLEVIEW_PROMPT_FULL.count(PHASE2_CONTRACT_END) != 1:
-        print("[ERROR] PHASE2 실행 계약 표식 누락 또는 중복")
-        return ""
-    start = CANDLEVIEW_PROMPT_FULL.find(PHASE2_CONTRACT_START)
-    end = CANDLEVIEW_PROMPT_FULL.find(PHASE2_CONTRACT_END, start)
-    if start < 0 or end < 0 or end <= start:
-        print("[ERROR] PHASE2 실행 계약 경계 무결성 실패")
-        return ""
-    contract = CANDLEVIEW_PROMPT_FULL[start:end + len(PHASE2_CONTRACT_END)].strip()
-    if not contract:
-        print("[ERROR] PHASE2 실행 계약이 비어 있음")
-        return ""
-    return contract
-
 # ============================================================
 # 분석 결과 임시 저장소 (chat_id 기준)
 # ============================================================
@@ -2147,11 +2121,8 @@ def run_phase2(phase1_result, symbol, exchange_name, phase1_canonical=None, phas
     if canonical_warnings or not model_url:
         return "[검증보류 — PHASE 2 실행 차단]\n" + "\n".join(f"• {w}" for w in (canonical_warnings or ["PHASE1 성공 모델 provenance 누락"]))
 
-    phase2_contract = _load_phase2_execution_contract()
-    if not phase2_contract:
-        return "[검증보류 — PHASE 2 실행 계약 누락]\n명세의 PHASE 2 전용 계약을 확인할 수 없어 최종 분석을 생성하지 않았습니다."
     base_prompt = (
-        f"{phase2_contract}\n\n"
+        f"{CANDLEVIEW_PROMPT_FULL}\n\n"
         f"아래는 이미 완성된 PHASE 1 결과입니다. 사용자는 PHASE 2 진행을 명시적으로 승인하였습니다.\n\n"
         f"[PHASE 1 canonical provenance]\n{json.dumps(phase1_canonical['provenance'], ensure_ascii=False, sort_keys=True)}\n\n"
         f"[PHASE 1 완성 결과]\n{phase1_result}\n\n"
