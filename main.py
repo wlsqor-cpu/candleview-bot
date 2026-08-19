@@ -3,6 +3,7 @@ import json
 import hashlib
 import os
 import re
+import secrets
 import threading
 import time
 import ccxt
@@ -229,18 +230,80 @@ if not CANDLEVIEW_PROMPT_FULL:
     print("[WARN] 엔진 파일을 찾지 못해 기본 문자열로 대체합니다.")
 
 # ============================================================
-# 분석 결과 임시 저장소 (chat_id 기준)
+# 분석 세션 임시 저장소
+# - 인라인 callback_data에는 사용자 입력·심볼·TF를 넣지 않는다. Telegram의 UTF-8 64바이트
+#   제약과 TF 2~4개 계약을 동시에 지키기 위해 서버 발급 세션 토큰만 사용한다.
+# - 동일 chat의 새 분석이 기존 세션을 덮어쓰지 않는다. 만료 전의 이전 버튼도 자기 세션만 참조한다.
+# - 프로세스 재시작 또는 TTL 만료 뒤에는 과거 시장 상태를 자동 재수집하지 않고 명시 재명령을 요구한다.
 # ============================================================
-analysis_cache = {}
+analysis_sessions = {}
+active_session_by_chat = {}
 CACHE_TTL_MINUTES = 30
+SESSION_TOKEN_BYTES = 12
+CALLBACK_PROTOCOL = "cv1"
+
+
+def _session_is_expired(data, now=None):
+    if not isinstance(data, dict) or not isinstance(data.get("created_at"), datetime):
+        return True
+    now = now or datetime.now()
+    return now - data["created_at"] > timedelta(minutes=CACHE_TTL_MINUTES)
+
+
+def _drop_analysis_session(session_id):
+    data = analysis_sessions.pop(session_id, None)
+    if data is not None and active_session_by_chat.get(data.get("chat_id")) == session_id:
+        del active_session_by_chat[data.get("chat_id")]
+
+
+def create_analysis_session(chat_id, session_data):
+    """검증된 분석 상태를 독립 세션으로 보존하고 고정 길이 토큰을 반환한다."""
+    if not isinstance(session_data, dict):
+        raise TypeError("analysis session data must be a dict")
+    session_id = secrets.token_urlsafe(SESSION_TOKEN_BYTES)
+    while session_id in analysis_sessions:
+        session_id = secrets.token_urlsafe(SESSION_TOKEN_BYTES)
+    record = dict(session_data)
+    record["chat_id"] = chat_id
+    record["session_id"] = session_id
+    record["created_at"] = datetime.now()
+    analysis_sessions[session_id] = record
+    active_session_by_chat[chat_id] = session_id
+    return session_id
+
+
+def get_analysis_session(chat_id, session_id, now=None):
+    """chat 바인딩·TTL을 함께 확인한다. 만료·타인 세션은 자동 재분석하지 않는다."""
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    data = analysis_sessions.get(session_id)
+    if data is None or data.get("chat_id") != chat_id:
+        return None
+    if _session_is_expired(data, now=now):
+        _drop_analysis_session(session_id)
+        return None
+    return data
 
 
 def clean_expired_cache():
+    """하위 호환 함수명은 유지하되, TTL 정리는 session 단위로 수행한다."""
     now = datetime.now()
-    expired = [cid for cid, data in analysis_cache.items()
-               if now - data["created_at"] > timedelta(minutes=CACHE_TTL_MINUTES)]
-    for cid in expired:
-        del analysis_cache[cid]
+    expired = [sid for sid, data in analysis_sessions.items() if _session_is_expired(data, now=now)]
+    for session_id in expired:
+        _drop_analysis_session(session_id)
+
+
+def parse_phase_callback(data):
+    """현재 프로토콜의 세션 콜백만 해석한다. 구형 입력형 콜백은 의도적으로 거부한다."""
+    if not isinstance(data, str):
+        return None, None
+    parts = data.split("|")
+    if len(parts) != 3 or parts[0] != CALLBACK_PROTOCOL:
+        return None, None
+    action, session_id = parts[1], parts[2]
+    if action not in ("phase1_view", "supplement_view", "phase2_run", "fractal_view"):
+        return None, None
+    return action, session_id
 
 
 # ============================================================
@@ -651,6 +714,70 @@ def validate_phase1_canonical(canonical):
     if hashlib.sha256(canonical["observations_payload"].encode("utf-8")).hexdigest() != provenance["raw_payload_sha256"]:
         return ["PHASE1 canonical 원천해시 불일치"]
     return []
+
+
+# ============================================================
+# PHASE 2 입력 provenance
+# - 카드 자연어와 STAGE 0 canonical은 역할이 다르다. 이 record는 원천 관측을 모델에
+#   재전송하지 않으며, 어떤 PHASE 1 결과·원천해시·품질상태가 PHASE 2에 연결됐는지만 고정한다.
+# - raw payload 전체를 다시 모델에 넣으면 token budget과 계산 계약이 달라지므로, 그 변경은
+#   별도 동등성 검증 전까지 금지한다.
+# ============================================================
+PHASE2_INPUT_PROVENANCE_SCHEMA = "PHASE2_INPUT_PROVENANCE_V1"
+
+
+def build_phase2_input_provenance(phase1_result, phase1_canonical):
+    """PHASE 2가 참조하는 PHASE 1 결과·원천 관측의 비식별 immutable fingerprint를 만든다."""
+    canonical = phase1_canonical or {}
+    provenance = canonical.get("provenance", {}) if isinstance(canonical, dict) else {}
+    quality = canonical.get("data_quality", {}) if isinstance(canonical, dict) else {}
+    tf_quality = quality.get("timeframes", []) if isinstance(quality, dict) else []
+    quality_summary = []
+    for item in tf_quality if isinstance(tf_quality, list) else []:
+        if isinstance(item, dict):
+            quality_summary.append({"tf": str(item.get("tf", "")), "status": str(item.get("status", ""))})
+    return {
+        "schema_version": PHASE2_INPUT_PROVENANCE_SCHEMA,
+        "phase1_result_sha256": hashlib.sha256(str(phase1_result or "").encode("utf-8")).hexdigest(),
+        "phase1_result_chars": len(str(phase1_result or "")),
+        "canonical_schema_version": str(canonical.get("schema_version", "")) if isinstance(canonical, dict) else "",
+        "raw_payload_sha256": str(provenance.get("raw_payload_sha256", "")),
+        "exchange": str(provenance.get("exchange", "")),
+        "symbol": str(provenance.get("symbol", "")),
+        "tf_quality": quality_summary,
+        "model_input_mode": "phase1_result_plus_canonical_provenance_only",
+    }
+
+
+def validate_phase2_input_provenance(record, phase1_result, phase1_canonical):
+    """저장된 provenance가 현재 PHASE 1 결과·canonical과 정확히 같은지 확인한다."""
+    expected = build_phase2_input_provenance(phase1_result, phase1_canonical)
+    if not isinstance(record, dict):
+        return ["P2I01 입력 provenance 누락"]
+    if set(record) != set(expected):
+        return ["P2I02 입력 provenance 스키마 불일치"]
+    mismatches = [key for key, expected_value in expected.items() if record.get(key) != expected_value]
+    if mismatches:
+        return ["P2I03 입력 provenance 불일치: " + ", ".join(sorted(mismatches))]
+    return []
+
+
+def _phase2_session_hash(session_id):
+    if not session_id:
+        return ""
+    return hashlib.sha256(str(session_id).encode("utf-8")).hexdigest()[:12]
+
+
+def log_phase2_observation(event, input_provenance=None, session_id=None, **details):
+    """원천 데이터·브리핑을 복제하지 않는 PHASE 2 운영 관측 로그."""
+    record = {
+        "event": str(event),
+        "session": _phase2_session_hash(session_id),
+        "input_schema": (input_provenance or {}).get("schema_version", ""),
+        "raw_payload_sha256": (input_provenance or {}).get("raw_payload_sha256", ""),
+    }
+    record.update(details)
+    print("[PHASE2_OBS] " + json.dumps(record, ensure_ascii=False, sort_keys=True))
 
 
 def resample_daily_to_weekly(ohlcv_1d):
@@ -1710,6 +1837,9 @@ def run_phase1(symbol_input, exchange_name, custom_tfs):
             )
         if canonical_warnings:
             phase1_result += "\n\n[자동검증 로그 — Python 사후검증]\n" + "\n".join(f"• {w}" for w in canonical_warnings)
+        # PHASE 1 최종 표시본까지 확정한 뒤 immutable fingerprint를 만든다.
+        # 이 값은 원천·카드가 이후 바뀌었을 때 PHASE 2 실행을 차단하는 용도이며, 모델 입력을 축약·변형하지 않는다.
+        supplement["phase2_input_provenance"] = build_phase2_input_provenance(phase1_result, phase1_canonical)
         return phase1_result, symbol, ex_name.upper(), supplement
 
     except Exception as e:
@@ -2016,6 +2146,36 @@ def verify_and_fix_phase2(text):
     return fixed
 
 
+def classify_phase2_verification_warnings(warnings, structured=False):
+    """검증 경고를 안정적인 운영 rule ID로 분류한다. 수식·결론·경고 원문은 변경하지 않는다."""
+    if structured:
+        return ["P2S01"]
+    rule_ids = set()
+    for warning in warnings or []:
+        text = str(warning)
+        if "근거원장" in text or "Source Bundle" in text:
+            rule_ids.add("P2V01")
+        if "축점수" in text or "순합방향" in text or "결론 방향" in text or "우세등급" in text or "축 부호" in text:
+            rule_ids.add("P2V02")
+        if "가격경로" in text:
+            rule_ids.add("P2V03")
+        if "메인 시나리오" in text or "반대·상쇄" in text or "과장 표현" in text:
+            rule_ids.add("P2V04")
+        if "OB(" in text or "상호중첩" in text:
+            rule_ids.add("P2V05")
+        if not any(rule_id in rule_ids for rule_id in ("P2V01", "P2V02", "P2V03", "P2V04", "P2V05")):
+            rule_ids.add("P2V99")
+    return sorted(rule_ids) or ["P2V99"]
+
+
+def extract_phase2_validation_warnings(verified_text):
+    marker = "[자동검증 로그 — Python 사후검증]"
+    if marker not in (verified_text or ""):
+        return []
+    tail = verified_text.split(marker, 1)[1]
+    return [line.strip().lstrip("•").strip() for line in tail.splitlines() if line.strip().lstrip("•").strip()]
+
+
 # ============================================================
 # PHASE 2 구조화 응답 렌더링 — 자연어 브리핑은 보존하고 검증 원장만 고정한다.
 # ============================================================
@@ -2109,17 +2269,25 @@ def render_phase2_structured_response(raw_json):
 # ============================================================
 # PHASE 2 전용 실행 (이미 완성된 PHASE 1을 재료로 사용)
 # ============================================================
-def run_phase2(phase1_result, symbol, exchange_name, phase1_canonical=None, phase1_model=None):
+def run_phase2(phase1_result, symbol, exchange_name, phase1_canonical=None, phase1_model=None,
+               phase2_input_provenance=None, session_id=None):
     if (phase1_model or {}).get("failed"):
+        log_phase2_observation("PRECHECK_HELD", phase2_input_provenance, session_id, rule_ids=["P2M01"])
         return (
             "[검증보류 — PHASE 1 AI 해석 미완료]\n"
             "원천 수집 데이터는 열람할 수 있으나 PHASE 1 해석이 완료되지 않아 최종 분석을 생성하지 않았습니다.\n"
             "가격·방향·확률·목표가는 제공되지 않습니다. 다시 분석을 실행해 주세요."
         )
     canonical_warnings = validate_phase1_canonical(phase1_canonical) if phase1_canonical else ["PHASE1 canonical 누락"]
+    input_warnings = validate_phase2_input_provenance(phase2_input_provenance, phase1_result, phase1_canonical)
     model_url = (phase1_model or {}).get("model_url")
-    if canonical_warnings or not model_url:
-        return "[검증보류 — PHASE 2 실행 차단]\n" + "\n".join(f"• {w}" for w in (canonical_warnings or ["PHASE1 성공 모델 provenance 누락"]))
+    precheck_warnings = list(canonical_warnings) + list(input_warnings)
+    if not model_url:
+        precheck_warnings.append("P2I04 PHASE1 성공 모델 provenance 누락")
+    if precheck_warnings:
+        rule_ids = sorted({warning.split()[0] if warning.startswith("P2I") else "P2I05" for warning in precheck_warnings})
+        log_phase2_observation("PRECHECK_HELD", phase2_input_provenance, session_id, rule_ids=rule_ids)
+        return "[검증보류 — PHASE 2 실행 차단]\n" + "\n".join(f"• {w}" for w in precheck_warnings)
 
     base_prompt = (
         f"{CANDLEVIEW_PROMPT_FULL}\n\n"
@@ -2134,29 +2302,51 @@ def run_phase2(phase1_result, symbol, exchange_name, phase1_canonical=None, phas
     )
     retry_context = ""
     last_verified = "[검증보류 — PHASE 2 결과 없음]"
+    last_rule_ids = ["P2V99"]
     for attempt in range(2):
+        log_phase2_observation("CALL_ATTEMPT", phase2_input_provenance, session_id, attempt=attempt + 1)
         raw_json, response_meta = call_gemini_api_with_retry(
             base_prompt + retry_context, max_tokens=12000, preferred_url=model_url, return_metadata=True,
             response_json_schema=_load_phase2_response_schema(),
         )
         if response_meta.get("failed"):
-            if response_meta.get("failure_kind") == "quota_exhausted":
+            failure_kind = response_meta.get("failure_kind", "model_call")
+            rule_id = "P2M02" if failure_kind == "quota_exhausted" else "P2M03"
+            log_phase2_observation("MODEL_HELD", phase2_input_provenance, session_id,
+                                   attempt=attempt + 1, rule_ids=[rule_id], failure_kind=failure_kind,
+                                   retry_after_seconds=response_meta.get("retry_after_seconds"))
+            if failure_kind == "quota_exhausted":
                 wait_seconds = response_meta.get("retry_after_seconds")
                 wait_hint = f" 약 {wait_seconds}초 후" if wait_seconds else " 잠시 후"
                 return "[검증보류 — PHASE 2 고정 모델 할당량 도달]" + wait_hint + " 동일 명령으로 다시 분석해 주세요."
             return "[검증보류 — PHASE 2 고정 모델 호출 실패]"
+        log_phase2_observation("MODEL_RESPONSE", phase2_input_provenance, session_id,
+                               attempt=attempt + 1, model_id=response_meta.get("model_id", ""),
+                               prompt_tokens=response_meta.get("prompt_token_count", 0),
+                               output_tokens=response_meta.get("output_token_count", 0),
+                               total_tokens=response_meta.get("total_token_count", 0))
         raw_result, structured_warnings = render_phase2_structured_response(raw_json)
         if structured_warnings:
+            last_rule_ids = classify_phase2_verification_warnings(structured_warnings, structured=True)
+            log_phase2_observation("STRUCTURED_HELD", phase2_input_provenance, session_id,
+                                   attempt=attempt + 1, rule_ids=last_rule_ids)
             last_verified = "[검증보류 — 구조화 출력 무결성 미통과]\n" + "\n".join(f"• {warning}" for warning in structured_warnings)
             retry_context = "\n\n[재질의 검증오류 — 같은 PHASE 1 원천·같은 모델로만 수정]\n" + "\n".join(structured_warnings)
             continue
         last_verified = verify_and_fix_phase2(raw_result)
-        if "[자동검증 로그 — Python 사후검증]" not in last_verified:
+        validation_warnings = extract_phase2_validation_warnings(last_verified)
+        if not validation_warnings:
+            log_phase2_observation("PUBLISHED", phase2_input_provenance, session_id, attempt=attempt + 1)
             return last_verified
-        retry_context = "\n\n[재질의 검증오류 — 같은 PHASE 1 원천·같은 모델로만 수정]\n" + last_verified.split("[자동검증 로그 — Python 사후검증]", 1)[1]
+        last_rule_ids = classify_phase2_verification_warnings(validation_warnings)
+        log_phase2_observation("VERIFY_HELD", phase2_input_provenance, session_id,
+                               attempt=attempt + 1, rule_ids=last_rule_ids)
+        retry_context = "\n\n[재질의 검증오류 — 같은 PHASE 1 원천·같은 모델로만 수정]\n" + "\n".join(validation_warnings)
+    log_phase2_observation("RETRY_EXHAUSTED", phase2_input_provenance, session_id, rule_ids=last_rule_ids)
     return (
         "[검증보류 — 최대 2회 재질의 후 무결성 미통과]\n"
         "근거원장 또는 3-C 검증을 통과하지 못해 이번 분석 결과를 발행하지 않았습니다.\n"
+        "사유 코드: " + ", ".join(last_rule_ids) + "\n"
         "가격·방향·확률·목표가는 제공되지 않습니다. 잠시 후 다시 실행해 주세요."
     )
 
@@ -2848,29 +3038,29 @@ def run_findcoin(ex_name):
 
 # ============================================================
 # 인라인 키보드 생성
-# callback_data에 거래소/심볼/TF를 함께 실어 보내, 캐시가 사라져도
-# 버튼만으로 동일 조건 재분석이 가능하도록 한다 (64byte 제한 내 안전 설계).
+# callback_data에는 서버 발급 분석 세션 토큰만 실어 Telegram 64바이트 제한을 지킨다.
+# 세션 만료·프로세스 재시작 뒤에는 새 시장 데이터를 위해 명시 재명령을 요구한다.
 # ============================================================
-def make_phase_keyboard(ex_name, symbol_raw, tfs):
-    tfs_str = ",".join(tfs)
-    payload_tail = f"{ex_name}|{symbol_raw}|{tfs_str}"
-    # Telegram callback_data 최대 64byte 안전장치: 가장 긴 액션명(supplement_view) 기준 초과시 TF 축약
-    if len(f"supplement_view|{payload_tail}".encode("utf-8")) > 64:
-        tfs_str = ",".join(tfs[:2])
-        payload_tail = f"{ex_name}|{symbol_raw}|{tfs_str}"
-    # [결함수정-Cowork44] 1차 축소(2개) 후 재검증이 없어, ex_name/symbol_raw 자체가 길면
-    # 여전히 초과할 수 있었다 — 재검증 후 필요시 1개로 추가 축소한다.
-    if len(f"supplement_view|{payload_tail}".encode("utf-8")) > 64:
-        tfs_str = ",".join(tfs[:1])
-        payload_tail = f"{ex_name}|{symbol_raw}|{tfs_str}"
+def make_phase_keyboard(session_id):
+    """분석 세션 토큰만 포함하는 inline keyboard를 생성한다.
+    사용자의 원문 심볼·한글명·TF는 callback_data에 싣지 않으므로 64바이트 제한과 TF 축약이 발생하지 않는다.
+    """
+    if not isinstance(session_id, str) or not session_id:
+        raise ValueError("analysis session id is required")
+
+    def _callback(action):
+        payload = f"{CALLBACK_PROTOCOL}|{action}|{session_id}"
+        if len(payload.encode("utf-8")) > 64:
+            raise ValueError("analysis callback payload exceeds Telegram 64-byte limit")
+        return payload
 
     return {
         "inline_keyboard": [
-            [{"text": "📊 코인 최종 분석내용 보기", "callback_data": f"phase2_run|{payload_tail}"}],
+            [{"text": "📊 코인 최종 분석내용 보기", "callback_data": _callback("phase2_run")}],
             [
-                {"text": "📋 수집데이터", "callback_data": f"phase1_view|{payload_tail}"},
-                {"text": "📈 보간지표", "callback_data": f"supplement_view|{payload_tail}"},
-                {"text": "🔬 정식모드", "callback_data": f"fractal_view|{payload_tail}"},
+                {"text": "📋 수집데이터", "callback_data": _callback("phase1_view")},
+                {"text": "📈 보간지표", "callback_data": _callback("supplement_view")},
+                {"text": "🔬 정식모드", "callback_data": _callback("fractal_view")},
             ],
         ]
     }
@@ -2930,15 +3120,14 @@ while True:
                 cb_id = callback["id"]
                 chat_id = callback["message"]["chat"]["id"]
                 data = callback.get("data", "")
-                cb_parts = data.split("|")
-                action = cb_parts[0] if cb_parts else ""
-                cb_ex = cb_parts[1] if len(cb_parts) > 1 else None
-                cb_sym = cb_parts[2] if len(cb_parts) > 2 else None
-                cb_tfs = cb_parts[3].split(",") if len(cb_parts) > 3 and cb_parts[3] else None
+                legacy_parts = data.split("|")
+                legacy_action = legacy_parts[0] if legacy_parts else ""
+                legacy_ex = legacy_parts[1] if len(legacy_parts) > 1 else None
+                legacy_sym = legacy_parts[2] if len(legacy_parts) > 2 else None
 
-                # FindCoin TOP1~3 상세분석 버튼 — 캐시확인 없이 즉시 신규분석 시작
-                if action == "fc_detail":
-                    fc_ex_name, fc_symbol = cb_ex, cb_sym
+                # FindCoin TOP1~3 상세분석 버튼은 독립 분석을 새로 시작한다.
+                if legacy_action == "fc_detail":
+                    fc_ex_name, fc_symbol = legacy_ex, legacy_sym
                     if fc_ex_name not in SUPPORTED_EXCHANGES or not fc_symbol:
                         answer_callback_query(cb_id, "요청 정보가 올바르지 않습니다.")
                         send_telegram_message(chat_id, "상세분석 요청 정보가 유효하지 않습니다.\n다시 코인 명령을 입력해 주세요.")
@@ -2955,70 +3144,43 @@ while True:
                     if d_symbol is None:
                         send_telegram_message(chat_id, d_phase1_result)
                         continue
-                    analysis_cache[chat_id] = {
+                    detail_session_id = create_analysis_session(chat_id, {
                         "phase1": d_phase1_result,
                         "symbol": d_symbol,
                         "exchange": d_exchange_display,
                         "supplement": d_supplement,
                         "ex_raw": d_exchange_display.lower(),
                         "sym_raw": fc_symbol,
-                        "tfs": fc_tfs,
-                        "created_at": datetime.now(),
-                    }
+                        "tfs": tuple(fc_tfs),
+                    })
                     send_telegram_message(
                         chat_id,
                         f"✅️ <b>CandleView</b> [{d_exchange_display}]\n{d_symbol}\n\n"
                         f"차트 상세 데이터 수집이 완료되었습니다.\n\n"
                         f"아래에서 원하는 항목을 선택하세요.",
-                        reply_markup=make_phase_keyboard(d_exchange_display.lower(), fc_symbol, fc_tfs)
+                        reply_markup=make_phase_keyboard(detail_session_id)
                     )
                     continue
 
-                cached = analysis_cache.get(chat_id)
-                cache_matches = bool(
-                    cached
-                    and cached.get("ex_raw") == cb_ex
-                    and cached.get("sym_raw") == cb_sym
-                )
-
-                if action not in ("phase1_view", "supplement_view", "phase2_run", "fractal_view"):
-                    answer_callback_query(cb_id)
-                    send_telegram_message(chat_id, "알 수 없는 요청입니다.\n다시 코인 명령을 입력해 주세요.")
+                action, session_id = parse_phase_callback(data)
+                if action is None:
+                    answer_callback_query(cb_id, "분석 세션을 찾을 수 없습니다.")
+                    send_telegram_message(chat_id, "분석 데이터가 만료되었거나 구형 버튼입니다.\n같은 코인 명령을 다시 입력해 새 데이터를 수집해 주세요.")
                     continue
 
-                if not cache_matches and (not cb_ex or not cb_sym or not cb_tfs):
-                    # 구버전 콜백(정보 없음) 등 재계산 불가 케이스만 안내 후 종료
-                    answer_callback_query(cb_id, "재분석 정보가 없습니다.")
-                    send_telegram_message(chat_id, "분석 데이터가 만료되었습니다.\n다시 코인 명령을 입력해 주세요.")
+                cached = get_analysis_session(chat_id, session_id)
+                if cached is None:
+                    answer_callback_query(cb_id, "분석 세션이 만료되었습니다.")
+                    send_telegram_message(chat_id, "분석 데이터가 만료되었거나 현재 대화의 세션이 아닙니다.\n같은 코인 명령을 다시 입력해 새 데이터를 수집해 주세요.")
                     continue
 
-                if not cache_matches:
-                    # 캐시 만료/불일치 시 버튼에 실려온 정보로 동일 조건 자동 재계산 (오류 대신 자동복구)
-                    answer_callback_query(cb_id, "데이터 재계산 중...")
-                    send_telegram_message(chat_id, "🕯️ <b>CandleView</b>\n이전 데이터가 만료되어 동일 조건으로 재계산합니다...")
-                    phase1_result, symbol, exchange_display, supplement = run_phase1(cb_sym, cb_ex, cb_tfs)
-                    if symbol is None:
-                        send_telegram_message(chat_id, phase1_result)
-                        continue
-                    analysis_cache[chat_id] = {
-                        "phase1": phase1_result,
-                        "symbol": symbol,
-                        "exchange": exchange_display,
-                        "supplement": supplement,
-                        "ex_raw": cb_ex,
-                        "sym_raw": cb_sym,
-                        "tfs": cb_tfs,
-                        "created_at": datetime.now(),
-                    }
-                    cached = analysis_cache[chat_id]
-                else:
-                    action_msg = {
-                        "phase1_view": "Phase1 데이터 불러오는 중...",
-                        "supplement_view": "보간 지표 불러오는 중...",
-                        "phase2_run": "Phase2 분석 실행 중...",
-                        "fractal_view": "정식 모드 보조 지표 불러오는 중...",
-                    }.get(action, "처리 중...")
-                    answer_callback_query(cb_id, action_msg)
+                action_msg = {
+                    "phase1_view": "Phase1 데이터 불러오는 중...",
+                    "supplement_view": "보간 지표 불러오는 중...",
+                    "phase2_run": "Phase2 분석 실행 중...",
+                    "fractal_view": "정식 모드 보조 지표 불러오는 중...",
+                }[action]
+                answer_callback_query(cb_id, action_msg)
 
                 if action == "phase1_view":
                     phase1_text = sanitize_html(cached["phase1"])
@@ -3046,6 +3208,8 @@ while True:
                         cached["exchange"],
                         (cached.get("supplement") or {}).get("phase1_canonical"),
                         (cached.get("supplement") or {}).get("phase1_model"),
+                        (cached.get("supplement") or {}).get("phase2_input_provenance"),
+                        cached.get("session_id"),
                     ))
                     model_line = format_model_provenance((cached.get("supplement") or {}).get("phase1_model"))
                     header = f"<b>CandleView — Phase2 최종 분석</b>\n{cached['exchange']} {cached['symbol']}\n{model_line}\n\n"
@@ -3216,17 +3380,16 @@ while True:
                 send_telegram_message(chat_id, phase1_result)
                 continue
 
-            # 캐시에 저장 (ex_raw/sym_raw는 콜백 재계산 시 run_phase1에 그대로 재사용되는 원본 파라미터)
-            analysis_cache[chat_id] = {
+            # 검증된 PHASE 1 상태를 독립 세션으로 보존한다. 새 분석이 과거 버튼의 상태를 덮어쓰지 않는다.
+            analysis_session_id = create_analysis_session(chat_id, {
                 "phase1": phase1_result,
                 "symbol": symbol,
                 "exchange": exchange_display,
                 "supplement": supplement,
                 "ex_raw": exchange_display.lower(),
                 "sym_raw": sym_clean,
-                "tfs": tfs,
-                "created_at": datetime.now(),
-            }
+                "tfs": tuple(tfs),
+            })
 
             # 안내 메시지 + 인라인 버튼
             model_line = format_model_provenance((supplement or {}).get("phase1_model"))
@@ -3238,7 +3401,7 @@ while True:
             )
             send_telegram_message(
                 chat_id, guide_msg,
-                reply_markup=make_phase_keyboard(exchange_display.lower(), sym_clean, tfs)
+                reply_markup=make_phase_keyboard(analysis_session_id)
             )
 
     except Exception as e:
