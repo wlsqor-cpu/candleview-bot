@@ -241,6 +241,7 @@ active_session_by_chat = {}
 CACHE_TTL_MINUTES = 30
 SESSION_TOKEN_BYTES = 12
 CALLBACK_PROTOCOL = "cv1"
+PHASE2_RETRY_MAX_PER_SESSION = 1
 
 
 def _session_is_expired(data, now=None):
@@ -267,6 +268,10 @@ def create_analysis_session(chat_id, session_data):
     record["chat_id"] = chat_id
     record["session_id"] = session_id
     record["created_at"] = datetime.now()
+    # PHASE 2는 사용자 승인 1회와 P2M03 전용 동일 세션 재시도 1회만 허용한다.
+    # 이 상태는 cache/session 안에만 존재하며, PHASE 1 원천·모델 결과를 변경하지 않는다.
+    record["phase2_state"] = "ready"
+    record["phase2_retry_count"] = 0
     analysis_sessions[session_id] = record
     active_session_by_chat[chat_id] = session_id
     return session_id
@@ -293,6 +298,49 @@ def clean_expired_cache():
         _drop_analysis_session(session_id)
 
 
+def begin_phase2_execution(session_data, action):
+    """PHASE 2 최초 승인 또는 P2M03 재시도의 단일 실행권을 원자적으로 취득한다."""
+    if not isinstance(session_data, dict):
+        return False, "분석 세션을 찾을 수 없습니다."
+    state = session_data.get("phase2_state", "ready")
+    retries = int(session_data.get("phase2_retry_count", 0) or 0)
+    if state == "in_progress":
+        return False, "동일 세션의 Phase2 분석이 이미 진행 중입니다."
+    if action == "phase2_run":
+        if state == "ready":
+            session_data["phase2_state"] = "in_progress"
+            return True, ""
+        if state == "retry_available":
+            return False, "고정 모델 연결 실패 후 재시도 버튼을 사용해 주세요."
+        return False, "이 세션의 Phase2 실행은 이미 종료되었습니다. 새 분석 명령을 사용해 주세요."
+    if action == "phase2_retry":
+        if state != "retry_available" or retries >= PHASE2_RETRY_MAX_PER_SESSION:
+            return False, "Phase2 재시도 가능 시간이 종료되었습니다. 새 분석 명령을 사용해 주세요."
+        session_data["phase2_retry_count"] = retries + 1
+        session_data["phase2_state"] = "in_progress"
+        return True, ""
+    return False, "지원하지 않는 Phase2 실행 요청입니다."
+
+
+def finish_phase2_execution(session_data, outcome):
+    """실행 결과에 따라 P2M03만 한 번의 동일 세션 재시도를 열고 나머지는 종료한다."""
+    if not isinstance(session_data, dict):
+        return "terminal"
+    retries = int(session_data.get("phase2_retry_count", 0) or 0)
+    if outcome == "P2M03" and retries < PHASE2_RETRY_MAX_PER_SESSION:
+        session_data["phase2_state"] = "retry_available"
+    elif outcome == "P2M03":
+        session_data["phase2_state"] = "retry_exhausted"
+    else:
+        session_data["phase2_state"] = "completed"
+    return session_data["phase2_state"]
+
+
+def is_p2m03_retryable_result(phase2_result):
+    """run_phase2의 명시적 P2M03 hold만 동일 세션 재시도 대상으로 인정한다."""
+    return isinstance(phase2_result, str) and phase2_result.startswith("[검증보류 — PHASE 2 고정 모델 호출 실패]")
+
+
 def parse_phase_callback(data):
     """현재 프로토콜의 세션 콜백만 해석한다. 구형 입력형 콜백은 의도적으로 거부한다."""
     if not isinstance(data, str):
@@ -301,7 +349,7 @@ def parse_phase_callback(data):
     if len(parts) != 3 or parts[0] != CALLBACK_PROTOCOL:
         return None, None
     action, session_id = parts[1], parts[2]
-    if action not in ("phase1_view", "supplement_view", "phase2_run", "fractal_view"):
+    if action not in ("phase1_view", "supplement_view", "phase2_run", "phase2_retry", "fractal_view"):
         return None, None
     return action, session_id
 
@@ -3041,6 +3089,16 @@ def run_findcoin(ex_name):
 # callback_data에는 서버 발급 분석 세션 토큰만 실어 Telegram 64바이트 제한을 지킨다.
 # 세션 만료·프로세스 재시작 뒤에는 새 시장 데이터를 위해 명시 재명령을 요구한다.
 # ============================================================
+def make_phase2_retry_keyboard(session_id):
+    """P2M03에서만 제공하는 동일 세션·동일 모델 PHASE 2 재시도 버튼."""
+    if not isinstance(session_id, str) or not session_id:
+        raise ValueError("analysis session id is required")
+    payload = f"{CALLBACK_PROTOCOL}|phase2_retry|{session_id}"
+    if len(payload.encode("utf-8")) > 64:
+        raise ValueError("analysis callback payload exceeds Telegram 64-byte limit")
+    return {"inline_keyboard": [[{"text": "🔄 Phase2 동일 모델로 다시 시도", "callback_data": payload}]]}
+
+
 def make_phase_keyboard(session_id):
     """분석 세션 토큰만 포함하는 inline keyboard를 생성한다.
     사용자의 원문 심볼·한글명·TF는 callback_data에 싣지 않으므로 64바이트 제한과 TF 축약이 발생하지 않는다.
@@ -3174,10 +3232,18 @@ while True:
                     send_telegram_message(chat_id, "분석 데이터가 만료되었거나 현재 대화의 세션이 아닙니다.\n같은 코인 명령을 다시 입력해 새 데이터를 수집해 주세요.")
                     continue
 
+                if action in ("phase2_run", "phase2_retry"):
+                    execution_started, execution_notice = begin_phase2_execution(cached, action)
+                    if not execution_started:
+                        answer_callback_query(cb_id, execution_notice)
+                        send_telegram_message(chat_id, execution_notice)
+                        continue
+
                 action_msg = {
                     "phase1_view": "Phase1 데이터 불러오는 중...",
                     "supplement_view": "보간 지표 불러오는 중...",
                     "phase2_run": "Phase2 분석 실행 중...",
+                    "phase2_retry": "동일 모델로 Phase2 재시도 중...",
                     "fractal_view": "정식 모드 보조 지표 불러오는 중...",
                 }[action]
                 answer_callback_query(cb_id, action_msg)
@@ -3195,27 +3261,44 @@ while True:
                     supp_text = format_supplement_display(cached.get("supplement"), cached["symbol"], cached["exchange"])
                     send_telegram_message(chat_id, supp_text)
 
-                elif action == "phase2_run":
+                elif action in ("phase2_run", "phase2_retry"):
+                    phase2_action_label = "최종 분석 진행" if action == "phase2_run" else "동일 모델 재시도"
                     send_telegram_message(
                         chat_id,
                         f"🕯️ <b>CandleView</b>\n"
-                        f"{cached['exchange']} {cached['symbol']} Phase2 최종 분석 진행 중...\n"
+                        f"{cached['exchange']} {cached['symbol']} Phase2 {phase2_action_label} 중...\n"
                         f"잠시만 기다려 주세요."
                     )
-                    phase2_result = sanitize_html(run_phase2(
-                        cached["phase1"],
-                        cached["symbol"],
-                        cached["exchange"],
-                        (cached.get("supplement") or {}).get("phase1_canonical"),
-                        (cached.get("supplement") or {}).get("phase1_model"),
-                        (cached.get("supplement") or {}).get("phase2_input_provenance"),
-                        cached.get("session_id"),
-                    ))
+                    try:
+                        raw_phase2_result = run_phase2(
+                            cached["phase1"],
+                            cached["symbol"],
+                            cached["exchange"],
+                            (cached.get("supplement") or {}).get("phase1_canonical"),
+                            (cached.get("supplement") or {}).get("phase1_model"),
+                            (cached.get("supplement") or {}).get("phase2_input_provenance"),
+                            cached.get("session_id"),
+                        )
+                    except Exception:
+                        # 예외는 기존 상위 실패 격리로 전달하되, 세션을 in_progress에 남기지 않는다.
+                        finish_phase2_execution(cached, "terminal")
+                        raise
+                    retry_state = finish_phase2_execution(
+                        cached, "P2M03" if is_p2m03_retryable_result(raw_phase2_result) else "terminal"
+                    )
+                    phase2_result = sanitize_html(raw_phase2_result)
                     model_line = format_model_provenance((cached.get("supplement") or {}).get("phase1_model"))
                     header = f"<b>CandleView — Phase2 최종 분석</b>\n{cached['exchange']} {cached['symbol']}\n{model_line}\n\n"
                     full = header + phase2_result
                     for chunk in smart_chunk(full, PHASE2_BOUNDARY_MARKERS):
                         send_telegram_message(chat_id, chunk)
+                    if retry_state == "retry_available":
+                        send_telegram_message(
+                            chat_id,
+                            "고정 분석 모델의 일시적 연결 실패가 확인되었습니다.\n"
+                            "PHASE 1 원천·모델 호출은 다시 실행하지 않고, 같은 세션·같은 모델로 PHASE 2만 한 번 재시도할 수 있습니다.",
+                            reply_markup=make_phase2_retry_keyboard(cached["session_id"]),
+                        )
 
                 elif action == "fractal_view":
                     send_telegram_message(
