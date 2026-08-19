@@ -2318,9 +2318,24 @@ def render_phase2_structured_response(raw_json):
 # PHASE 2 전용 실행 (이미 완성된 PHASE 1을 재료로 사용)
 # ============================================================
 def run_phase2(phase1_result, symbol, exchange_name, phase1_canonical=None, phase1_model=None,
-               phase2_input_provenance=None, session_id=None):
+               phase2_input_provenance=None, session_id=None, session_execution_ordinal=1,
+               trigger_action="phase2_run"):
+    """PHASE 2 실행. attempt는 내부 재질의 순번, execution ordinal은 세션 실행 순번이다."""
+    try:
+        session_execution_ordinal = int(session_execution_ordinal)
+    except (TypeError, ValueError):
+        session_execution_ordinal = 1
+    session_execution_ordinal = max(1, session_execution_ordinal)
+    if trigger_action not in ("phase2_run", "phase2_retry"):
+        trigger_action = "phase2_run"
+
+    def observe(event, **details):
+        details.setdefault("session_execution_ordinal", session_execution_ordinal)
+        details.setdefault("trigger_action", trigger_action)
+        log_phase2_observation(event, phase2_input_provenance, session_id, **details)
+
     if (phase1_model or {}).get("failed"):
-        log_phase2_observation("PRECHECK_HELD", phase2_input_provenance, session_id, rule_ids=["P2M01"])
+        observe("PRECHECK_HELD", rule_ids=["P2M01"])
         return (
             "[검증보류 — PHASE 1 AI 해석 미완료]\n"
             "원천 수집 데이터는 열람할 수 있으나 PHASE 1 해석이 완료되지 않아 최종 분석을 생성하지 않았습니다.\n"
@@ -2334,7 +2349,7 @@ def run_phase2(phase1_result, symbol, exchange_name, phase1_canonical=None, phas
         precheck_warnings.append("P2I04 PHASE1 성공 모델 provenance 누락")
     if precheck_warnings:
         rule_ids = sorted({warning.split()[0] if warning.startswith("P2I") else "P2I05" for warning in precheck_warnings})
-        log_phase2_observation("PRECHECK_HELD", phase2_input_provenance, session_id, rule_ids=rule_ids)
+        observe("PRECHECK_HELD", rule_ids=rule_ids)
         return "[검증보류 — PHASE 2 실행 차단]\n" + "\n".join(f"• {w}" for w in precheck_warnings)
 
     base_prompt = (
@@ -2352,7 +2367,7 @@ def run_phase2(phase1_result, symbol, exchange_name, phase1_canonical=None, phas
     last_verified = "[검증보류 — PHASE 2 결과 없음]"
     last_rule_ids = ["P2V99"]
     for attempt in range(2):
-        log_phase2_observation("CALL_ATTEMPT", phase2_input_provenance, session_id, attempt=attempt + 1)
+        observe("CALL_ATTEMPT", attempt=attempt + 1)
         raw_json, response_meta = call_gemini_api_with_retry(
             base_prompt + retry_context, max_tokens=12000, preferred_url=model_url, return_metadata=True,
             response_json_schema=_load_phase2_response_schema(),
@@ -2360,37 +2375,33 @@ def run_phase2(phase1_result, symbol, exchange_name, phase1_canonical=None, phas
         if response_meta.get("failed"):
             failure_kind = response_meta.get("failure_kind", "model_call")
             rule_id = "P2M02" if failure_kind == "quota_exhausted" else "P2M03"
-            log_phase2_observation("MODEL_HELD", phase2_input_provenance, session_id,
-                                   attempt=attempt + 1, rule_ids=[rule_id], failure_kind=failure_kind,
-                                   retry_after_seconds=response_meta.get("retry_after_seconds"))
+            observe("MODEL_HELD", attempt=attempt + 1, rule_ids=[rule_id], failure_kind=failure_kind,
+                    retry_after_seconds=response_meta.get("retry_after_seconds"))
             if failure_kind == "quota_exhausted":
                 wait_seconds = response_meta.get("retry_after_seconds")
                 wait_hint = f" 약 {wait_seconds}초 후" if wait_seconds else " 잠시 후"
                 return "[검증보류 — PHASE 2 고정 모델 할당량 도달]" + wait_hint + " 동일 명령으로 다시 분석해 주세요."
             return "[검증보류 — PHASE 2 고정 모델 호출 실패]"
-        log_phase2_observation("MODEL_RESPONSE", phase2_input_provenance, session_id,
-                               attempt=attempt + 1, model_id=response_meta.get("model_id", ""),
-                               prompt_tokens=response_meta.get("prompt_token_count", 0),
-                               output_tokens=response_meta.get("output_token_count", 0),
-                               total_tokens=response_meta.get("total_token_count", 0))
+        observe("MODEL_RESPONSE", attempt=attempt + 1, model_id=response_meta.get("model_id", ""),
+                prompt_tokens=response_meta.get("prompt_token_count", 0),
+                output_tokens=response_meta.get("output_token_count", 0),
+                total_tokens=response_meta.get("total_token_count", 0))
         raw_result, structured_warnings = render_phase2_structured_response(raw_json)
         if structured_warnings:
             last_rule_ids = classify_phase2_verification_warnings(structured_warnings, structured=True)
-            log_phase2_observation("STRUCTURED_HELD", phase2_input_provenance, session_id,
-                                   attempt=attempt + 1, rule_ids=last_rule_ids)
+            observe("STRUCTURED_HELD", attempt=attempt + 1, rule_ids=last_rule_ids)
             last_verified = "[검증보류 — 구조화 출력 무결성 미통과]\n" + "\n".join(f"• {warning}" for warning in structured_warnings)
             retry_context = "\n\n[재질의 검증오류 — 같은 PHASE 1 원천·같은 모델로만 수정]\n" + "\n".join(structured_warnings)
             continue
         last_verified = verify_and_fix_phase2(raw_result)
         validation_warnings = extract_phase2_validation_warnings(last_verified)
         if not validation_warnings:
-            log_phase2_observation("PUBLISHED", phase2_input_provenance, session_id, attempt=attempt + 1)
+            observe("PUBLISHED", attempt=attempt + 1)
             return last_verified
         last_rule_ids = classify_phase2_verification_warnings(validation_warnings)
-        log_phase2_observation("VERIFY_HELD", phase2_input_provenance, session_id,
-                               attempt=attempt + 1, rule_ids=last_rule_ids)
+        observe("VERIFY_HELD", attempt=attempt + 1, rule_ids=last_rule_ids)
         retry_context = "\n\n[재질의 검증오류 — 같은 PHASE 1 원천·같은 모델로만 수정]\n" + "\n".join(validation_warnings)
-    log_phase2_observation("RETRY_EXHAUSTED", phase2_input_provenance, session_id, rule_ids=last_rule_ids)
+    observe("RETRY_EXHAUSTED", rule_ids=last_rule_ids)
     return (
         "[검증보류 — 최대 2회 재질의 후 무결성 미통과]\n"
         "근거원장 또는 3-C 검증을 통과하지 못해 이번 분석 결과를 발행하지 않았습니다.\n"
@@ -3276,9 +3287,11 @@ while True:
                             cached["exchange"],
                             (cached.get("supplement") or {}).get("phase1_canonical"),
                             (cached.get("supplement") or {}).get("phase1_model"),
-                            (cached.get("supplement") or {}).get("phase2_input_provenance"),
-                            cached.get("session_id"),
-                        )
+                        (cached.get("supplement") or {}).get("phase2_input_provenance"),
+                        cached.get("session_id"),
+                        1 + int(cached.get("phase2_retry_count", 0) or 0),
+                        action,
+                    )
                     except Exception:
                         # 예외는 기존 상위 실패 격리로 전달하되, 세션을 in_progress에 남기지 않는다.
                         finish_phase2_execution(cached, "terminal")
