@@ -362,16 +362,16 @@ def classify_phase2_retryable_result(phase2_result):
     """명시적 P2M02/P2M03 hold만 같은 session 재시도 대상으로 인정한다."""
     if not isinstance(phase2_result, str):
         return None
-    if phase2_result.startswith("[검증보류 — PHASE 2 고정 모델 할당량 도달]"):
+    if phase2_result.startswith("[검증보류 — PHASE 2 승인 모델 할당량 도달]"):
         return "P2M02"
-    if phase2_result.startswith("[검증보류 — PHASE 2 고정 모델 호출 실패]"):
+    if phase2_result.startswith("[검증보류 — PHASE 2 승인 모델 호출 실패]"):
         return "P2M03"
     return None
 
 
 def is_p2m03_retryable_result(phase2_result):
     """run_phase2의 명시적 P2M03 hold만 동일 세션 재시도 대상으로 인정한다."""
-    return isinstance(phase2_result, str) and phase2_result.startswith("[검증보류 — PHASE 2 고정 모델 호출 실패]")
+    return isinstance(phase2_result, str) and phase2_result.startswith("[검증보류 — PHASE 2 승인 모델 호출 실패]")
 
 
 def extract_p2m02_retry_after_seconds(phase2_result):
@@ -1513,7 +1513,8 @@ def _bounded_retry_delay_seconds(attempt_index, retry_after_seconds=None, jitter
     return base + max(0.0, float(jitter))
 
 
-def call_gemini_api_with_retry(full_prompt, max_tokens=16384, preferred_url=None, return_metadata=False, response_json_schema=None):
+def call_gemini_api_with_retry(full_prompt, max_tokens=16384, preferred_url=None, return_metadata=False,
+                               response_json_schema=None, allow_preferred_fallback=False):
     headers = {
         "Content-Type": "application/json",
         "X-goog-api-key": GEMINI_API_KEY,
@@ -1533,10 +1534,21 @@ def call_gemini_api_with_retry(full_prompt, max_tokens=16384, preferred_url=None
         payload["generationConfig"]["responseMimeType"] = "application/json"
         payload["generationConfig"]["responseJsonSchema"] = response_json_schema
 
-    roster = get_approved_model_roster() if preferred_url is None else []
-    # PHASE 2는 PHASE 1 성공 모델을 고정한다. 해당 모델 실패 시 다른 모델로 조용히 전환하지 않는다.
-    candidates = ([{"model_url": preferred_url, "model_id": _model_id_from_url(preferred_url), "selection_source": "PHASE 1 고정"}]
-                  if preferred_url else roster)
+    roster = get_approved_model_roster()
+    if preferred_url:
+        # PHASE 2는 PHASE 1 성공 모델을 첫 후보로 고정한다. 승인된 fallback은 명시적 호출자만 허용한다.
+        candidates = [{"model_url": preferred_url, "model_id": _model_id_from_url(preferred_url), "selection_source": "PHASE 1 성공 모델"}]
+        if allow_preferred_fallback:
+            preferred_rank = next((index for index, approved in enumerate(roster)
+                                   if approved["model_url"] == preferred_url), None)
+            # 승인 roster의 뒤 순위로만 전환한다. 3.6으로 성공한 PHASE 1을 3.7로 역방향 재시도하지 않는다.
+            if preferred_rank is not None:
+                for approved in roster[preferred_rank + 1:]:
+                    fallback_candidate = dict(approved)
+                    fallback_candidate["selection_source"] = "PHASE 2 승인 fallback"
+                    candidates.append(fallback_candidate)
+    else:
+        candidates = roster
     if not candidates:
         failure_text = "AI 분석 모델을 선택하지 못했습니다. 분석 결과는 생성되지 않았습니다."
         failure_metadata = {"model_url": "", "response_model_version": "", "failed": True, "failure_kind": "model_selection"}
@@ -1544,8 +1556,10 @@ def call_gemini_api_with_retry(full_prompt, max_tokens=16384, preferred_url=None
 
     last_failure_kind = "model_call"
     last_retry_after_seconds = None
-    for candidate in candidates:
+    last_model_url = ""
+    for candidate_index, candidate in enumerate(candidates):
         url = candidate["model_url"]
+        last_model_url = url
         for transport_attempt in range(2):
             try:
                 res = requests.post(url, headers=headers, json=payload, timeout=120)
@@ -1586,10 +1600,10 @@ def call_gemini_api_with_retry(full_prompt, max_tokens=16384, preferred_url=None
                     time.sleep(_bounded_retry_delay_seconds(transport_attempt))
                 elif res.status_code == 429:
                     # 일·분 단위 할당량은 즉시 같은 요청을 재시도해도 회복되지 않을 수 있다.
-                    # PHASE 2는 PHASE 1 모델 고정 계약을 지키므로 다른 모델로 전환하지 않는다.
+                    # 명시적으로 허용된 PHASE 2 경로만 뒤 순위 승인 모델로 같은 입력을 대체 호출할 수 있다.
                     last_failure_kind = "quota_exhausted"
                     last_retry_after_seconds = _response_retry_after_seconds(res)
-                    print("[WARN] Gemini 할당량 제한(429): PHASE 2 모델 고정 계약에 따라 fallback 없이 보류")
+                    print("[WARN] Gemini 할당량 제한(429): 승인 roster의 허용된 다음 후보를 확인합니다")
                     break
                 elif res.status_code == 503:
                     last_failure_kind = "service_unavailable"
@@ -1602,8 +1616,13 @@ def call_gemini_api_with_retry(full_prompt, max_tokens=16384, preferred_url=None
                 last_failure_kind = "network_exception"
                 print(f"[WARN] Gemini 호출 예외: {e}")
                 time.sleep(_bounded_retry_delay_seconds(transport_attempt))
+        # PHASE 2 fallback은 1차 성공 모델이 quota·503으로 실제 응답하지 못한 경우에만 허용한다.
+        # 다른 형태의 실패는 PHASE 1→PHASE 2 모델 결속을 임의로 바꾸지 않고 보류한다.
+        if preferred_url and allow_preferred_fallback and candidate_index == 0:
+            if last_failure_kind not in ("quota_exhausted", "service_unavailable"):
+                break
     failure_text = "AI 서버 일시적 과부하 또는 모델 접근 불가 상태입니다. 잠시 후 다시 시도해 주세요."
-    failure_metadata = {"model_url": preferred_url or "", "response_model_version": "", "failed": True,
+    failure_metadata = {"model_url": last_model_url, "response_model_version": "", "failed": True,
                         "failure_kind": last_failure_kind, "retry_after_seconds": last_retry_after_seconds}
     return (failure_text, failure_metadata) if return_metadata else failure_text
 
@@ -2567,7 +2586,7 @@ def extract_phase2_briefing_fallback(raw_json):
 # ============================================================
 def run_phase2(phase1_result, symbol, exchange_name, phase1_canonical=None, phase1_model=None,
                phase2_input_provenance=None, session_id=None, session_execution_ordinal=1,
-               trigger_action="phase2_run"):
+               trigger_action="phase2_run", phase2_execution_metadata=None):
     """PHASE 2 실행. attempt는 내부 재질의 순번, execution ordinal은 세션 실행 순번이다."""
     try:
         session_execution_ordinal = int(session_execution_ordinal)
@@ -2626,8 +2645,11 @@ def run_phase2(phase1_result, symbol, exchange_name, phase1_canonical=None, phas
         observe("CALL_ATTEMPT", attempt=attempt + 1, request_kind="lightweight_repair" if is_lightweight_repair else "full_phase2")
         raw_json, response_meta = call_gemini_api_with_retry(
             request_prompt, max_tokens=request_max_tokens, preferred_url=model_url, return_metadata=True,
-            response_json_schema=_load_phase2_response_schema(),
+            response_json_schema=_load_phase2_response_schema(), allow_preferred_fallback=True,
         )
+        if isinstance(phase2_execution_metadata, dict):
+            phase2_execution_metadata.clear()
+            phase2_execution_metadata.update(response_meta)
         if response_meta.get("failed"):
             failure_kind = response_meta.get("failure_kind", "model_call")
             rule_id = "P2M02" if failure_kind == "quota_exhausted" else "P2M03"
@@ -2636,9 +2658,11 @@ def run_phase2(phase1_result, symbol, exchange_name, phase1_canonical=None, phas
             if failure_kind == "quota_exhausted":
                 wait_seconds = response_meta.get("retry_after_seconds")
                 wait_hint = f" 약 {wait_seconds}초 후" if wait_seconds else " 잠시 후"
-                return "[검증보류 — PHASE 2 고정 모델 할당량 도달]" + wait_hint + " 재시도해 주세요."
-            return "[검증보류 — PHASE 2 고정 모델 호출 실패]"
+                return "[검증보류 — PHASE 2 승인 모델 할당량 도달]" + wait_hint + " 재시도해 주세요."
+            return "[검증보류 — PHASE 2 승인 모델 호출 실패]"
         observe("MODEL_RESPONSE", attempt=attempt + 1, model_id=response_meta.get("model_id", ""),
+                fallback_used=bool(response_meta.get("fallback_used")),
+                selection_source=response_meta.get("selection_source", ""),
                 prompt_tokens=response_meta.get("prompt_token_count", 0),
                 output_tokens=response_meta.get("output_token_count", 0),
                 total_tokens=response_meta.get("total_token_count", 0))
@@ -3535,7 +3559,7 @@ while True:
                     "phase1_view": "Phase1 데이터 불러오는 중...",
                     "supplement_view": "보간 지표 불러오는 중...",
                     "phase2_run": "Phase2 분석 실행 중...",
-                    "phase2_retry": "동일 모델로 Phase2 재시도 중...",
+                    "phase2_retry": "동일 원천으로 Phase2 재시도 중...",
                     "fractal_view": "정식 모드 보조 지표 불러오는 중...",
                 }[action]
                 answer_callback_query(cb_id, action_msg)
@@ -3554,13 +3578,14 @@ while True:
                     send_telegram_message(chat_id, supp_text)
 
                 elif action in ("phase2_run", "phase2_retry"):
-                    phase2_action_label = "최종 분석 진행" if action == "phase2_run" else "동일 모델 재시도"
+                    phase2_action_label = "최종 분석 진행" if action == "phase2_run" else "동일 원천 재시도"
                     send_telegram_message(
                         chat_id,
                         f"🕯️ <b>CandleView</b>\n"
                         f"{cached['exchange']} {cached['symbol']} Phase2 {phase2_action_label} 중...\n"
                         f"잠시만 기다려 주세요."
                     )
+                    phase2_meta = {}
                     try:
                         raw_phase2_result = run_phase2(
                             cached["phase1"],
@@ -3569,10 +3594,11 @@ while True:
                             (cached.get("supplement") or {}).get("phase1_canonical"),
                             (cached.get("supplement") or {}).get("phase1_model"),
                         (cached.get("supplement") or {}).get("phase2_input_provenance"),
-                        cached.get("session_id"),
-                        1 + int(cached.get("phase2_retry_count", 0) or 0),
-                        action,
-                    )
+                            cached.get("session_id"),
+                            1 + int(cached.get("phase2_retry_count", 0) or 0),
+                            action,
+                            phase2_execution_metadata=phase2_meta,
+                        )
                     except Exception:
                         # 예외는 기존 상위 실패 격리로 전달하되, 세션을 in_progress에 남기지 않는다.
                         finish_phase2_execution(cached, "terminal")
@@ -3584,7 +3610,7 @@ while True:
                         retry_after_seconds=extract_p2m02_retry_after_seconds(raw_phase2_result),
                     )
                     phase2_result = sanitize_html(raw_phase2_result)
-                    model_line = format_model_provenance((cached.get("supplement") or {}).get("phase1_model"))
+                    model_line = format_model_provenance(phase2_meta or (cached.get("supplement") or {}).get("phase1_model"))
                     header = f"<b>CandleView — Phase2 최종 분석</b>\n{cached['exchange']} {cached['symbol']}\n{model_line}\n\n"
                     full = header + phase2_result
                     for chunk in smart_chunk(full, PHASE2_BOUNDARY_MARKERS):
@@ -3592,13 +3618,13 @@ while True:
                     if retry_state == "retry_available":
                         if retry_outcome == "P2M02":
                             retry_notice = (
-                                "고정 분석 모델의 할당량 대기 상태가 확인되었습니다.\n"
-                                "PHASE 1 원천·모델 호출은 다시 실행하지 않습니다. 안내된 대기 시간 뒤 같은 세션·같은 모델로 PHASE 2만 한 번 재시도할 수 있습니다."
+                                "승인 분석 모델의 할당량 대기 상태가 확인되었습니다.\n"
+                                "PHASE 1 원천·모델 호출은 다시 실행하지 않습니다. 안내된 대기 시간 뒤 같은 세션·같은 원천으로 PHASE 2만 한 번 재시도할 수 있습니다."
                             )
                         else:
                             retry_notice = (
-                                "고정 분석 모델의 일시적 연결 실패가 확인되었습니다.\n"
-                                "PHASE 1 원천·모델 호출은 다시 실행하지 않고, 같은 세션·같은 모델로 PHASE 2만 한 번 재시도할 수 있습니다."
+                                "승인 분석 모델의 일시적 연결 실패가 확인되었습니다.\n"
+                                "PHASE 1 원천·모델 호출은 다시 실행하지 않고, 같은 세션·같은 원천으로 PHASE 2만 한 번 재시도할 수 있습니다."
                             )
                         send_telegram_message(
                             chat_id,
