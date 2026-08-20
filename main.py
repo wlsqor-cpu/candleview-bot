@@ -268,7 +268,7 @@ def create_analysis_session(chat_id, session_data):
     record["chat_id"] = chat_id
     record["session_id"] = session_id
     record["created_at"] = datetime.now()
-    # PHASE 2는 사용자 승인 1회와 P2M03 전용 동일 세션 재시도 1회만 허용한다.
+    # PHASE 2는 사용자 승인 1회와 P2M02/P2M03 동일 세션 재시도 1회만 허용한다.
     # 이 상태는 cache/session 안에만 존재하며, PHASE 1 원천·모델 결과를 변경하지 않는다.
     record["phase2_state"] = "ready"
     record["phase2_retry_count"] = 0
@@ -298,8 +298,8 @@ def clean_expired_cache():
         _drop_analysis_session(session_id)
 
 
-def begin_phase2_execution(session_data, action):
-    """PHASE 2 최초 승인 또는 P2M03 재시도의 단일 실행권을 원자적으로 취득한다."""
+def begin_phase2_execution(session_data, action, now=None):
+    """PHASE 2 최초 승인 또는 P2M02/P2M03 재시도의 단일 실행권을 원자적으로 취득한다."""
     if not isinstance(session_data, dict):
         return False, "분석 세션을 찾을 수 없습니다."
     state = session_data.get("phase2_state", "ready")
@@ -311,34 +311,76 @@ def begin_phase2_execution(session_data, action):
             session_data["phase2_state"] = "in_progress"
             return True, ""
         if state == "retry_available":
-            return False, "고정 모델 연결 실패 후 재시도 버튼을 사용해 주세요."
+            return False, "PHASE 2 보류 후 재시도 버튼을 사용해 주세요."
         return False, "이 세션의 Phase2 실행은 이미 종료되었습니다. 새 분석 명령을 사용해 주세요."
     if action == "phase2_retry":
         if state != "retry_available" or retries >= PHASE2_RETRY_MAX_PER_SESSION:
             return False, "Phase2 재시도 가능 시간이 종료되었습니다. 새 분석 명령을 사용해 주세요."
+        retry_not_before = session_data.get("phase2_retry_not_before")
+        current_time = now or datetime.now()
+        if isinstance(retry_not_before, datetime) and current_time < retry_not_before:
+            remaining_seconds = max(1, int((retry_not_before - current_time).total_seconds() + 0.999))
+            return False, f"고정 모델 할당량 재시도 대기 중입니다. 약 {remaining_seconds}초 후 다시 눌러 주세요."
         session_data["phase2_retry_count"] = retries + 1
         session_data["phase2_state"] = "in_progress"
+        session_data.pop("phase2_retry_not_before", None)
         return True, ""
     return False, "지원하지 않는 Phase2 실행 요청입니다."
 
 
-def finish_phase2_execution(session_data, outcome):
-    """실행 결과에 따라 P2M03만 한 번의 동일 세션 재시도를 열고 나머지는 종료한다."""
+def finish_phase2_execution(session_data, outcome, retry_after_seconds=None, now=None):
+    """P2M02/P2M03만 같은 session의 PHASE 2 재시도를 한 번 열고, 나머지는 종료한다."""
     if not isinstance(session_data, dict):
         return "terminal"
     retries = int(session_data.get("phase2_retry_count", 0) or 0)
-    if outcome == "P2M03" and retries < PHASE2_RETRY_MAX_PER_SESSION:
+    if outcome in ("P2M02", "P2M03") and retries < PHASE2_RETRY_MAX_PER_SESSION:
         session_data["phase2_state"] = "retry_available"
-    elif outcome == "P2M03":
+        session_data["phase2_retry_reason"] = outcome
+        if outcome == "P2M02":
+            try:
+                delay_seconds = max(0, min(int(retry_after_seconds or 0), CACHE_TTL_MINUTES * 60))
+            except (TypeError, ValueError):
+                delay_seconds = 0
+            if delay_seconds:
+                session_data["phase2_retry_not_before"] = (now or datetime.now()) + timedelta(seconds=delay_seconds)
+            else:
+                session_data.pop("phase2_retry_not_before", None)
+        else:
+            session_data.pop("phase2_retry_not_before", None)
+    elif outcome in ("P2M02", "P2M03"):
         session_data["phase2_state"] = "retry_exhausted"
+        session_data.pop("phase2_retry_not_before", None)
     else:
         session_data["phase2_state"] = "completed"
+        session_data.pop("phase2_retry_not_before", None)
+        session_data.pop("phase2_retry_reason", None)
     return session_data["phase2_state"]
+
+
+def classify_phase2_retryable_result(phase2_result):
+    """명시적 P2M02/P2M03 hold만 같은 session 재시도 대상으로 인정한다."""
+    if not isinstance(phase2_result, str):
+        return None
+    if phase2_result.startswith("[검증보류 — PHASE 2 고정 모델 할당량 도달]"):
+        return "P2M02"
+    if phase2_result.startswith("[검증보류 — PHASE 2 고정 모델 호출 실패]"):
+        return "P2M03"
+    return None
 
 
 def is_p2m03_retryable_result(phase2_result):
     """run_phase2의 명시적 P2M03 hold만 동일 세션 재시도 대상으로 인정한다."""
     return isinstance(phase2_result, str) and phase2_result.startswith("[검증보류 — PHASE 2 고정 모델 호출 실패]")
+
+
+def extract_p2m02_retry_after_seconds(phase2_result):
+    """P2M02의 시스템 생성 안내문에서 TTL 이내 provider 재시도 대기만 추출한다."""
+    if classify_phase2_retryable_result(phase2_result) != "P2M02":
+        return None
+    matched = re.search(r"약\s+(\d+)\s*초 후", phase2_result)
+    if not matched:
+        return None
+    return max(0, min(int(matched.group(1)), CACHE_TTL_MINUTES * 60))
 
 
 def parse_phase_callback(data):
@@ -2380,7 +2422,7 @@ def run_phase2(phase1_result, symbol, exchange_name, phase1_canonical=None, phas
             if failure_kind == "quota_exhausted":
                 wait_seconds = response_meta.get("retry_after_seconds")
                 wait_hint = f" 약 {wait_seconds}초 후" if wait_seconds else " 잠시 후"
-                return "[검증보류 — PHASE 2 고정 모델 할당량 도달]" + wait_hint + " 동일 명령으로 다시 분석해 주세요."
+                return "[검증보류 — PHASE 2 고정 모델 할당량 도달]" + wait_hint + " 재시도해 주세요."
             return "[검증보류 — PHASE 2 고정 모델 호출 실패]"
         observe("MODEL_RESPONSE", attempt=attempt + 1, model_id=response_meta.get("model_id", ""),
                 prompt_tokens=response_meta.get("prompt_token_count", 0),
@@ -3296,8 +3338,11 @@ while True:
                         # 예외는 기존 상위 실패 격리로 전달하되, 세션을 in_progress에 남기지 않는다.
                         finish_phase2_execution(cached, "terminal")
                         raise
+                    retry_outcome = classify_phase2_retryable_result(raw_phase2_result)
                     retry_state = finish_phase2_execution(
-                        cached, "P2M03" if is_p2m03_retryable_result(raw_phase2_result) else "terminal"
+                        cached,
+                        retry_outcome or "terminal",
+                        retry_after_seconds=extract_p2m02_retry_after_seconds(raw_phase2_result),
                     )
                     phase2_result = sanitize_html(raw_phase2_result)
                     model_line = format_model_provenance((cached.get("supplement") or {}).get("phase1_model"))
@@ -3306,10 +3351,19 @@ while True:
                     for chunk in smart_chunk(full, PHASE2_BOUNDARY_MARKERS):
                         send_telegram_message(chat_id, chunk)
                     if retry_state == "retry_available":
+                        if retry_outcome == "P2M02":
+                            retry_notice = (
+                                "고정 분석 모델의 할당량 대기 상태가 확인되었습니다.\n"
+                                "PHASE 1 원천·모델 호출은 다시 실행하지 않습니다. 안내된 대기 시간 뒤 같은 세션·같은 모델로 PHASE 2만 한 번 재시도할 수 있습니다."
+                            )
+                        else:
+                            retry_notice = (
+                                "고정 분석 모델의 일시적 연결 실패가 확인되었습니다.\n"
+                                "PHASE 1 원천·모델 호출은 다시 실행하지 않고, 같은 세션·같은 모델로 PHASE 2만 한 번 재시도할 수 있습니다."
+                            )
                         send_telegram_message(
                             chat_id,
-                            "고정 분석 모델의 일시적 연결 실패가 확인되었습니다.\n"
-                            "PHASE 1 원천·모델 호출은 다시 실행하지 않고, 같은 세션·같은 모델로 PHASE 2만 한 번 재시도할 수 있습니다.",
+                            retry_notice,
                             reply_markup=make_phase2_retry_keyboard(cached["session_id"]),
                         )
 
