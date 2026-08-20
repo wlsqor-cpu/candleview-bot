@@ -1981,7 +1981,8 @@ LEDGER_FORBIDDEN_WORDS = ("완벽한 정합", "즉시 돌파 확정", "무조건
 
 
 def _extract_ledger_value(ledger_text, label):
-    match = re.search(rf"^{re.escape(label)}\s*:\s*(.+?)\s*$", ledger_text, re.MULTILINE)
+    """동일 줄의 label:value만 읽고, axis의 빈 값은 정상으로 허용한다."""
+    match = re.search(rf"^{re.escape(label)}[ \t]*:[ \t]*(.*)$", ledger_text or "", re.MULTILINE)
     return match.group(1).strip() if match else ""
 
 
@@ -2091,6 +2092,9 @@ def verify_and_strip_evidence_ledger(text):
 
     ledger = match.group(1)
     for field in LEDGER_FIELDS:
+        # axis의 빈 값·생략은 실제 점수 부호 배정이 판단한다. 이 단계는 비축 필수값만 관측한다.
+        if field in LEDGER_AXIS_FIELDS:
+            continue
         value = _extract_ledger_value(ledger, field)
         if not value:
             warnings.append(f"근거원장 필드 누락: {field}")
@@ -2320,7 +2324,89 @@ def _derived_axis_sets(scores, net_direction):
 
 
 def _replace_ledger_line(text, label, value):
-    return re.sub(rf"(?m)^{re.escape(label)}\s*:\s*.*$", f"{label}: {value}", text, count=1)
+    """동일 줄 label을 교체한다. 누락 label은 이 함수에서 새로 만들지 않는다."""
+    return re.sub(
+        rf"(?m)^{re.escape(label)}[ \t]*:[^\r\n]*$",
+        f"{label}: {value}", text or "", count=1,
+    )
+
+
+def _upsert_ledger_line(text, label, value):
+    """기존 label은 교체하고, 없으면 Bundle 직전의 동일 내부 ledger에만 삽입한다."""
+    replaced = _replace_ledger_line(text, label, value)
+    if replaced != (text or ""):
+        return replaced
+    bundle_at = (text or "").find("Bundle:")
+    line = f"{label}: {value}\n"
+    return (text or "") + "\n" + line if bundle_at < 0 else text[:bundle_at] + line + text[bundle_at:]
+
+
+def normalize_evidence_ledger_for_publication(text):
+    """파생 ledger 결손만 기존 수식으로 보완하고, 나머지는 비차단 관측으로 남긴다."""
+    metadata = {"normalized_fields": [], "observation_codes": []}
+    match = re.search(r"\[INTERNAL_EVIDENCE_LEDGER\](.*?)\[/INTERNAL_EVIDENCE_LEDGER\]", text or "", re.DOTALL)
+    if not match:
+        metadata["observation_codes"].append("LEDGER_ABSENT")
+        return text, metadata
+
+    ledger = match.group(1)
+    scores, score_warnings = _extract_signed_axis_scores(_extract_ledger_value(ledger, "축점수"))
+    expected_axes = {"S_1", "S_2", "S_3", "S_4"}
+    score_is_usable = (
+        not score_warnings and set(scores) == expected_axes and LEDGER_SCORE_LIMIT is not None
+        and all(np.isfinite(value) and -LEDGER_SCORE_LIMIT <= value <= LEDGER_SCORE_LIMIT for value in scores.values())
+    )
+    if not score_is_usable:
+        metadata["observation_codes"].append("LEDGER_CORE_UNAVAILABLE")
+        return text, metadata
+
+    net_direction = _direction_from_net(sum(scores.values()))
+    adjustment = _extract_ledger_value(ledger, "등급보정")
+    briefing = text[:match.start()]
+    visible = re.search(r"(상방|하방|횡보)\s*우세\s*\(우세\s*등급\s*:\s*(강|보통|약함|횡보)", briefing)
+    expected_grade = _expected_final_grade(scores, net_direction, adjustment) if adjustment in ("없음", "대형임펄스반전") else None
+    axis_sets = _derived_axis_sets(scores, net_direction)
+    replacements = {
+        "결론": net_direction,
+        "순합방향": net_direction,
+        "지지축": ", ".join(axis_sets["지지축"]) if axis_sets["지지축"] else "없음",
+        "반대축": ", ".join(axis_sets["반대축"]) if axis_sets["반대축"] else "없음",
+        "상충축": ", ".join(axis_sets["상충축"]) if axis_sets["상충축"] else "없음",
+        "중립축": ", ".join(axis_sets["중립축"]) if axis_sets["중립축"] else "없음",
+    }
+    if expected_grade is not None:
+        replacements["등급"] = expected_grade
+    elif visible:
+        replacements["등급"] = visible.group(2)
+        metadata["observation_codes"].append("LEDGER_GRADE_FROM_VISIBLE")
+
+    repaired_ledger = ledger
+    for label, value in replacements.items():
+        current = _extract_ledger_value(repaired_ledger, label)
+        if current != value:
+            repaired_ledger = _upsert_ledger_line(repaired_ledger, label, value)
+            metadata["normalized_fields"].append(label)
+
+    repaired_briefing = briefing
+    if visible and expected_grade is not None:
+        expected_decision = f"{net_direction} 우세 (우세 등급: {expected_grade})"
+        if visible.group(0) != expected_decision:
+            repaired_briefing = re.sub(
+                r"(상방|하방|횡보)\s*우세\s*\(우세\s*등급\s*:\s*(강|보통|약함|횡보)\)",
+                expected_decision, briefing, count=1,
+            )
+            metadata["normalized_fields"].append("visible_decision")
+    elif not visible:
+        metadata["observation_codes"].append("LEDGER_VISIBLE_DECISION_UNLOCATABLE")
+
+    if metadata["normalized_fields"]:
+        metadata["observation_codes"].append("LEDGER_DERIVED_NORMALIZED")
+    return repaired_briefing + LEDGER_START + repaired_ledger + LEDGER_END + text[match.end():], metadata
+
+
+def strip_phase2_validation_log(text):
+    """내부 검증 로그는 관측으로만 보존하고 사용자 브리핑에는 붙이지 않는다."""
+    return (text or "").split("[자동검증 로그 — Python 사후검증]", 1)[0].rstrip()
 
 
 def try_deterministic_phase2_repair(text, warnings):
@@ -2466,6 +2552,16 @@ def render_phase2_structured_response(raw_json):
         return "", [f"PHASE2 구조화 JSON 파싱 실패: {exc}"]
 
 
+def extract_phase2_briefing_fallback(raw_json):
+    """ledger 결손과 사용자 브리핑 부재를 구분한다. 새 내용은 만들지 않는다."""
+    try:
+        response = json.loads(raw_json)
+        briefing = response.get("user_briefing") if isinstance(response, dict) else None
+        return briefing.strip() if isinstance(briefing, str) and briefing.strip() else ""
+    except (json.JSONDecodeError, TypeError):
+        return ""
+
+
 # ============================================================
 # PHASE 2 전용 실행 (이미 완성된 PHASE 1을 재료로 사용)
 # ============================================================
@@ -2548,35 +2644,44 @@ def run_phase2(phase1_result, symbol, exchange_name, phase1_canonical=None, phas
                 total_tokens=response_meta.get("total_token_count", 0))
         raw_result, structured_warnings = render_phase2_structured_response(raw_json)
         if structured_warnings:
-            last_rule_ids = classify_phase2_verification_warnings(structured_warnings, structured=True)
-            observe("STRUCTURED_HELD", attempt=attempt + 1, rule_ids=last_rule_ids, rule_subcodes=["P2S01"])
-            last_verified = "[검증보류 — 구조화 출력 무결성 미통과]\n" + "\n".join(f"• {warning}" for warning in structured_warnings)
-            lightweight_repair_prompt = build_phase2_lightweight_repair_prompt(raw_json, structured_warnings)
-            continue
-        last_verified = verify_and_fix_phase2(raw_result)
-        validation_warnings = extract_phase2_validation_warnings(last_verified)
-        if not validation_warnings:
-            observe("PUBLISHED", attempt=attempt + 1)
-            return last_verified
-        last_rule_ids = classify_phase2_verification_warnings(validation_warnings)
-        warning_subcodes = phase2_validation_subcodes(validation_warnings)
-        observe("VERIFY_HELD", attempt=attempt + 1, rule_ids=last_rule_ids, rule_subcodes=warning_subcodes)
-        repaired_result, repair_meta = try_deterministic_phase2_repair(raw_result, validation_warnings)
-        if repaired_result is not None:
-            repaired_verified = verify_and_fix_phase2(repaired_result)
-            repaired_warnings = extract_phase2_validation_warnings(repaired_verified)
-            if not repaired_warnings:
+            fallback_briefing = extract_phase2_briefing_fallback(raw_json)
+            if fallback_briefing:
                 observe(
-                    "DETERMINISTIC_REPAIRED", attempt=attempt + 1, rule_ids=last_rule_ids,
-                    rule_subcodes=repair_meta.get("subcodes", []), changed_fields=repair_meta.get("changed_fields", 0),
+                    "STRUCTURED_LEDGER_OBSERVED", attempt=attempt + 1, rule_ids=["P2S01"],
+                    observation_codes=["LEDGER_ABSENT"],
                 )
                 observe("PUBLISHED", attempt=attempt + 1)
-                return repaired_verified
-            validation_warnings = repaired_warnings
+                return fallback_briefing
+            # user_briefing 자체가 없을 때만 한 번의 경량 repair를 허용한다.
+            last_rule_ids = classify_phase2_verification_warnings(structured_warnings, structured=True)
+            observe("STRUCTURED_BRIEFING_HELD", attempt=attempt + 1, rule_ids=last_rule_ids, rule_subcodes=["P2S01"])
+            last_verified = "[검증보류 — 사용자 브리핑 누락]\n" + "\n".join(f"• {warning}" for warning in structured_warnings)
+            lightweight_repair_prompt = build_phase2_lightweight_repair_prompt(raw_json, structured_warnings)
+            continue
+
+        normalized_result, normalization_meta = normalize_evidence_ledger_for_publication(raw_result)
+        last_verified = verify_and_fix_phase2(normalized_result)
+        validation_warnings = extract_phase2_validation_warnings(last_verified)
+        if normalization_meta.get("normalized_fields"):
+            observe(
+                "LEDGER_NORMALIZED", attempt=attempt + 1, rule_ids=["P2V02"],
+                normalized_fields=normalization_meta["normalized_fields"],
+                observation_codes=normalization_meta.get("observation_codes", []),
+            )
+        if validation_warnings:
             last_rule_ids = classify_phase2_verification_warnings(validation_warnings)
-            warning_subcodes = phase2_validation_subcodes(validation_warnings)
-            observe("REPAIR_HELD", attempt=attempt + 1, rule_ids=last_rule_ids, rule_subcodes=warning_subcodes)
-        lightweight_repair_prompt = build_phase2_lightweight_repair_prompt(raw_json, validation_warnings)
+            observe(
+                "VALIDATION_OBSERVED", attempt=attempt + 1, rule_ids=last_rule_ids,
+                rule_subcodes=phase2_validation_subcodes(validation_warnings),
+                observation_codes=normalization_meta.get("observation_codes", []),
+            )
+        elif normalization_meta.get("observation_codes"):
+            observe(
+                "LEDGER_OBSERVED", attempt=attempt + 1, rule_ids=["P2V01"],
+                observation_codes=normalization_meta["observation_codes"],
+            )
+        observe("PUBLISHED", attempt=attempt + 1)
+        return strip_phase2_validation_log(last_verified)
     observe("RETRY_EXHAUSTED", rule_ids=last_rule_ids)
     return (
         "[검증보류 — 최대 2회 재질의 후 무결성 미통과]\n"
