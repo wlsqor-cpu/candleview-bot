@@ -4,6 +4,7 @@ import hashlib
 import os
 import re
 import secrets
+import random
 import threading
 import time
 import ccxt
@@ -1487,6 +1488,31 @@ def get_approved_model_roster():
 # ============================================================
 # Gemini API 호출
 # ============================================================
+def _response_retry_after_seconds(response):
+    """Gemini RetryInfo를 안전하게 초 단위로 읽는다. 원문 오류는 기록하지 않는다."""
+    try:
+        detail = response.json()
+        retry_info = next((item for item in detail.get("error", {}).get("details", [])
+                           if item.get("@type", "").endswith("RetryInfo")), {})
+        delay_text = str(retry_info.get("retryDelay", "")).rstrip("s")
+        return int(float(delay_text)) if delay_text else None
+    except Exception:
+        return None
+
+
+def _bounded_retry_delay_seconds(attempt_index, retry_after_seconds=None, jitter=None):
+    """provider delay를 우선하고, 없으면 1·2·4…초 bounded backoff에 작은 jitter를 더한다."""
+    if retry_after_seconds is not None:
+        try:
+            return max(0, min(int(retry_after_seconds), 60))
+        except (TypeError, ValueError):
+            pass
+    base = min(30, 2 ** max(0, int(attempt_index)))
+    if jitter is None:
+        jitter = random.uniform(0.0, min(1.0, base * 0.25))
+    return base + max(0.0, float(jitter))
+
+
 def call_gemini_api_with_retry(full_prompt, max_tokens=16384, preferred_url=None, return_metadata=False, response_json_schema=None):
     headers = {
         "Content-Type": "application/json",
@@ -1520,7 +1546,7 @@ def call_gemini_api_with_retry(full_prompt, max_tokens=16384, preferred_url=None
     last_retry_after_seconds = None
     for candidate in candidates:
         url = candidate["model_url"]
-        for _ in range(2):
+        for transport_attempt in range(2):
             try:
                 res = requests.post(url, headers=headers, json=payload, timeout=120)
                 if res.status_code == 200:
@@ -1557,24 +1583,17 @@ def call_gemini_api_with_retry(full_prompt, max_tokens=16384, preferred_url=None
                         return (answer_text, metadata) if return_metadata else answer_text
                     # 사고과정만 오고 최종 답변 파트가 비어있는 경우(토큰 예산 소진 등) 재시도로 넘긴다
                     print(f"[WARN] Gemini 응답에 최종 답변 파트 없음(사고과정만 수신, parts={len(parts)}개), 재시도")
-                    time.sleep(1)
+                    time.sleep(_bounded_retry_delay_seconds(transport_attempt))
                 elif res.status_code == 429:
                     # 일·분 단위 할당량은 즉시 같은 요청을 재시도해도 회복되지 않을 수 있다.
                     # PHASE 2는 PHASE 1 모델 고정 계약을 지키므로 다른 모델로 전환하지 않는다.
                     last_failure_kind = "quota_exhausted"
-                    try:
-                        detail = res.json()
-                        retry_info = next((item for item in detail.get("error", {}).get("details", [])
-                                           if item.get("@type", "").endswith("RetryInfo")), {})
-                        delay_text = str(retry_info.get("retryDelay", "")).rstrip("s")
-                        last_retry_after_seconds = int(float(delay_text)) if delay_text else None
-                    except Exception:
-                        pass
+                    last_retry_after_seconds = _response_retry_after_seconds(res)
                     print("[WARN] Gemini 할당량 제한(429): PHASE 2 모델 고정 계약에 따라 fallback 없이 보류")
                     break
                 elif res.status_code == 503:
                     last_failure_kind = "service_unavailable"
-                    time.sleep(3)
+                    time.sleep(_bounded_retry_delay_seconds(transport_attempt, _response_retry_after_seconds(res)))
                 else:
                     last_failure_kind = f"http_{res.status_code}"
                     print(f"[WARN] Gemini 응답 코드: {res.status_code}")
@@ -1582,7 +1601,7 @@ def call_gemini_api_with_retry(full_prompt, max_tokens=16384, preferred_url=None
             except Exception as e:
                 last_failure_kind = "network_exception"
                 print(f"[WARN] Gemini 호출 예외: {e}")
-                time.sleep(2)
+                time.sleep(_bounded_retry_delay_seconds(transport_attempt))
     failure_text = "AI 서버 일시적 과부하 또는 모델 접근 불가 상태입니다. 잠시 후 다시 시도해 주세요."
     failure_metadata = {"model_url": preferred_url or "", "response_model_version": "", "failed": True,
                         "failure_kind": last_failure_kind, "retry_after_seconds": last_retry_after_seconds}
@@ -2271,6 +2290,97 @@ def extract_phase2_validation_warnings(verified_text):
 # ============================================================
 # 배포 단위는 CandleView_API.txt + main.py 두 파일로 고정한다.
 # 구조화 응답 스키마는 외부 파일이 아니라 main.py 내부 상수로 보존한다.
+def phase2_validation_subcodes(warnings):
+    """P2V 원문을 저장하지 않고, 반복 원인만 안정적인 세부 code로 관측한다."""
+    subcodes = set()
+    for warning in warnings or []:
+        text = str(warning)
+        if "3-C 순합방향 불일치" in text:
+            subcodes.add("P2V02_NET_DIRECTION")
+        if "3-C 결론 방향 불일치" in text:
+            subcodes.add("P2V02_CONCLUSION")
+        if "3-C 우세등급 불일치" in text:
+            subcodes.add("P2V02_GRADE")
+        if "근거원장 축 부호 배정 불일치" in text:
+            subcodes.add("P2V02_AXIS_ASSIGNMENT")
+        if "근거원장과 메인 시나리오의 방향·우세등급 불일치" in text:
+            subcodes.add("P2V02_VISIBLE_DECISION")
+        if "축점수 범위 오류" in text or "축점수 완전성 오류" in text or "축점수 숫자 파싱 오류" in text:
+            subcodes.add("P2V02_SCORE_RANGE")
+    return sorted(subcodes)
+
+
+def _derived_axis_sets(scores, net_direction):
+    return {
+        "지지축": [axis for axis, value in scores.items() if net_direction != "횡보" and ((net_direction == "상방" and value > LEDGER_ZERO_EPS) or (net_direction == "하방" and value < -LEDGER_ZERO_EPS))],
+        "반대축": [axis for axis, value in scores.items() if net_direction != "횡보" and ((net_direction == "상방" and value < -LEDGER_ZERO_EPS) or (net_direction == "하방" and value > LEDGER_ZERO_EPS))],
+        "상충축": [axis for axis, value in scores.items() if net_direction == "횡보" and abs(value) > LEDGER_ZERO_EPS],
+        "중립축": [axis for axis, value in scores.items() if abs(value) <= LEDGER_ZERO_EPS],
+    }
+
+
+def _replace_ledger_line(text, label, value):
+    return re.sub(rf"(?m)^{re.escape(label)}\s*:\s*.*$", f"{label}: {value}", text, count=1)
+
+
+def try_deterministic_phase2_repair(text, warnings):
+    """모델의 중복 ledger 파생 필드만 기존 Python 수식으로 맞춘다. 점수·가격·원천은 수정하지 않는다."""
+    allowed_prefixes = (
+        "3-C 순합방향 불일치", "3-C 결론 방향 불일치", "3-C 우세등급 불일치",
+        "근거원장 축 부호 배정 불일치", "근거원장과 메인 시나리오의 방향·우세등급 불일치",
+    )
+    warnings = [str(warning) for warning in warnings or []]
+    metadata = {"repaired": False, "model_calls": 0, "subcodes": phase2_validation_subcodes(warnings), "changed_fields": 0}
+    if not warnings or any(not warning.startswith(allowed_prefixes) for warning in warnings):
+        return None, metadata
+    ledger_match = re.search(r"\[INTERNAL_EVIDENCE_LEDGER\](.*?)\[/INTERNAL_EVIDENCE_LEDGER\]", text or "", re.DOTALL)
+    if not ledger_match:
+        return None, metadata
+    ledger = ledger_match.group(1)
+    scores, score_warnings = _extract_signed_axis_scores(_extract_ledger_value(ledger, "축점수"))
+    adjustment = _extract_ledger_value(ledger, "등급보정")
+    expected_axes = {"S_1", "S_2", "S_3", "S_4"}
+    if score_warnings or set(scores) != expected_axes or LEDGER_SCORE_LIMIT is None:
+        return None, metadata
+    if not all(np.isfinite(value) and -LEDGER_SCORE_LIMIT <= value <= LEDGER_SCORE_LIMIT for value in scores.values()):
+        return None, metadata
+    if adjustment not in ("없음", "대형임펄스반전"):
+        return None, metadata
+    decision_pattern = r"(상방|하방|횡보)\s*우세\s*\(우세\s*등급\s*:\s*(강|보통|약함|횡보)\)"
+    briefing = text[:ledger_match.start()]
+    if len(re.findall(decision_pattern, briefing)) != 1:
+        return None, metadata
+    net_direction = _direction_from_net(sum(scores.values()))
+    grade = _expected_final_grade(scores, net_direction, adjustment)
+    axis_sets = _derived_axis_sets(scores, net_direction)
+    repaired_ledger = ledger
+    replacements = {
+        "결론": net_direction, "등급": grade, "순합방향": net_direction,
+        "지지축": ", ".join(axis_sets["지지축"]) if axis_sets["지지축"] else "없음",
+        "반대축": ", ".join(axis_sets["반대축"]) if axis_sets["반대축"] else "없음",
+        "상충축": ", ".join(axis_sets["상충축"]) if axis_sets["상충축"] else "없음",
+        "중립축": ", ".join(axis_sets["중립축"]) if axis_sets["중립축"] else "없음",
+    }
+    for label, value in replacements.items():
+        repaired_ledger = _replace_ledger_line(repaired_ledger, label, value)
+    repaired_briefing = re.sub(decision_pattern, f"{net_direction} 우세 (우세 등급: {grade})", briefing, count=1)
+    repaired = repaired_briefing + LEDGER_START + repaired_ledger + LEDGER_END + text[ledger_match.end():]
+    metadata.update({"repaired": True, "changed_fields": len(replacements) + 1})
+    return repaired, metadata
+
+
+def build_phase2_lightweight_repair_prompt(provisional_json, warnings):
+    """원천·전체 명세를 재주입하지 않는 제한된 JSON repair prompt를 만든다."""
+    safe_warnings = "\n".join(f"- {str(warning)[:240]}" for warning in (warnings or [])[:12])
+    return (
+        "[PHASE 2 경량 검증 repair]\n"
+        "아래 provisional JSON만 수정하십시오. 새 수치·새 원천 사실·새 시나리오를 추가하지 마십시오. "
+        "검증오류와 직접 관련된 JSON 필드만 고치고, 동일 response JSON schema의 완전한 JSON 하나만 반환하십시오.\n\n"
+        "[검증오류]\n" + safe_warnings + "\n\n"
+        "[provisional JSON]\n" + str(provisional_json)
+    )
+
+
 PHASE2_RESPONSE_SCHEMA = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object", "additionalProperties": False,
@@ -2405,13 +2515,21 @@ def run_phase2(phase1_result, symbol, exchange_name, phase1_canonical=None, phas
         f"tf·window·fact·direction·role·axis 여섯 필드를 모두 가진 JSON 객체여야 합니다. "
         f"direction은 상방·하방·중립, role은 결정·국면·보조·가격경로, axis는 S_1~S_4 중 하나만 사용하십시오."
     )
-    retry_context = ""
+    lightweight_repair_prompt = None
     last_verified = "[검증보류 — PHASE 2 결과 없음]"
     last_rule_ids = ["P2V99"]
     for attempt in range(2):
-        observe("CALL_ATTEMPT", attempt=attempt + 1)
+        is_lightweight_repair = lightweight_repair_prompt is not None
+        request_prompt = lightweight_repair_prompt if is_lightweight_repair else base_prompt
+        request_max_tokens = 3500 if is_lightweight_repair else 12000
+        if is_lightweight_repair:
+            observe(
+                "LIGHTWEIGHT_REPAIR_ATTEMPT", attempt=attempt + 1,
+                input_bytes=len(request_prompt.encode("utf-8")), max_output_tokens=request_max_tokens,
+            )
+        observe("CALL_ATTEMPT", attempt=attempt + 1, request_kind="lightweight_repair" if is_lightweight_repair else "full_phase2")
         raw_json, response_meta = call_gemini_api_with_retry(
-            base_prompt + retry_context, max_tokens=12000, preferred_url=model_url, return_metadata=True,
+            request_prompt, max_tokens=request_max_tokens, preferred_url=model_url, return_metadata=True,
             response_json_schema=_load_phase2_response_schema(),
         )
         if response_meta.get("failed"):
@@ -2431,9 +2549,9 @@ def run_phase2(phase1_result, symbol, exchange_name, phase1_canonical=None, phas
         raw_result, structured_warnings = render_phase2_structured_response(raw_json)
         if structured_warnings:
             last_rule_ids = classify_phase2_verification_warnings(structured_warnings, structured=True)
-            observe("STRUCTURED_HELD", attempt=attempt + 1, rule_ids=last_rule_ids)
+            observe("STRUCTURED_HELD", attempt=attempt + 1, rule_ids=last_rule_ids, rule_subcodes=["P2S01"])
             last_verified = "[검증보류 — 구조화 출력 무결성 미통과]\n" + "\n".join(f"• {warning}" for warning in structured_warnings)
-            retry_context = "\n\n[재질의 검증오류 — 같은 PHASE 1 원천·같은 모델로만 수정]\n" + "\n".join(structured_warnings)
+            lightweight_repair_prompt = build_phase2_lightweight_repair_prompt(raw_json, structured_warnings)
             continue
         last_verified = verify_and_fix_phase2(raw_result)
         validation_warnings = extract_phase2_validation_warnings(last_verified)
@@ -2441,8 +2559,24 @@ def run_phase2(phase1_result, symbol, exchange_name, phase1_canonical=None, phas
             observe("PUBLISHED", attempt=attempt + 1)
             return last_verified
         last_rule_ids = classify_phase2_verification_warnings(validation_warnings)
-        observe("VERIFY_HELD", attempt=attempt + 1, rule_ids=last_rule_ids)
-        retry_context = "\n\n[재질의 검증오류 — 같은 PHASE 1 원천·같은 모델로만 수정]\n" + "\n".join(validation_warnings)
+        warning_subcodes = phase2_validation_subcodes(validation_warnings)
+        observe("VERIFY_HELD", attempt=attempt + 1, rule_ids=last_rule_ids, rule_subcodes=warning_subcodes)
+        repaired_result, repair_meta = try_deterministic_phase2_repair(raw_result, validation_warnings)
+        if repaired_result is not None:
+            repaired_verified = verify_and_fix_phase2(repaired_result)
+            repaired_warnings = extract_phase2_validation_warnings(repaired_verified)
+            if not repaired_warnings:
+                observe(
+                    "DETERMINISTIC_REPAIRED", attempt=attempt + 1, rule_ids=last_rule_ids,
+                    rule_subcodes=repair_meta.get("subcodes", []), changed_fields=repair_meta.get("changed_fields", 0),
+                )
+                observe("PUBLISHED", attempt=attempt + 1)
+                return repaired_verified
+            validation_warnings = repaired_warnings
+            last_rule_ids = classify_phase2_verification_warnings(validation_warnings)
+            warning_subcodes = phase2_validation_subcodes(validation_warnings)
+            observe("REPAIR_HELD", attempt=attempt + 1, rule_ids=last_rule_ids, rule_subcodes=warning_subcodes)
+        lightweight_repair_prompt = build_phase2_lightweight_repair_prompt(raw_json, validation_warnings)
     observe("RETRY_EXHAUSTED", rule_ids=last_rule_ids)
     return (
         "[검증보류 — 최대 2회 재질의 후 무결성 미통과]\n"
