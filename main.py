@@ -2423,9 +2423,19 @@ def normalize_evidence_ledger_for_publication(text):
     return repaired_briefing + LEDGER_START + repaired_ledger + LEDGER_END + text[match.end():], metadata
 
 
+PHASE2_INTERNAL_SUCCESS_FOOTER = (
+    "시스템 무결성 검증 완료\n"
+    "■ API Direct Data Parsing 완료\n"
+    "■ Layer 5-B 인라인 검증 100% 통과"
+)
+
+
 def strip_phase2_validation_log(text):
-    """내부 검증 로그는 관측으로만 보존하고 사용자 브리핑에는 붙이지 않는다."""
-    return (text or "").split("[자동검증 로그 — Python 사후검증]", 1)[0].rstrip()
+    """내부 검증 로그와 정확 일치하는 성공 footer만 숨기고, 검증보류 안내는 보존한다."""
+    cleaned = (text or "").split("[자동검증 로그 — Python 사후검증]", 1)[0].rstrip()
+    if cleaned.endswith(PHASE2_INTERNAL_SUCCESS_FOOTER):
+        cleaned = cleaned[:-len(PHASE2_INTERNAL_SUCCESS_FOOTER)].rstrip()
+    return cleaned
 
 
 def try_deterministic_phase2_repair(text, warnings):
