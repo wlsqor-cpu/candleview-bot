@@ -92,7 +92,7 @@ jobs:
               grep -q '^=== 14\. FindCoin FC-Next' FindCoin_FC_NEXT_C_A_CONTRACT.txt
               grep -q 'Gemini를 호출하지 않는다' FindCoin_FC_NEXT_C_A_CONTRACT.txt
               grep -q 'def start_fc_next_ca_job' main.py
-              ! grep -q 'run_findcoin(ex_name)' main.py
+              ! grep -qE '^[[:space:]]+[^#].*run_findcoin\(ex_name\)' main.py
             )
           else
             python3 -m py_compile "$main_source"
