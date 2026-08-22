@@ -1,26 +1,21 @@
-name: CandleView Release File Resolver
-
+name: CandleView Release Bundle Resolver
 on:
   push:
     branches: [main]
     paths:
       - "releases/**"
-
 permissions:
   contents: write
-
 jobs:
   resolve-and-promote:
-    name: Validate and promote one CandleView file pair
+    name: Validate and promote one CandleView release bundle
     runs-on: ubuntu-latest
-
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: Resolve, validate, and promote source files
+      - name: Resolve, validate, and promote one release bundle
         shell: bash
         env:
           EVENT_BEFORE_SHA: ${{ github.event.before }}
@@ -28,16 +23,11 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-
           normalize_name() {
             LC_ALL=C tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]//g'
           }
-
           main_candidates=()
           spec_candidates=()
-
-          # 이전 releases 파일 전체를 재탐색하지 않는다. 현재 push 커밋에서 바뀐 파일만
-          # 후보로 사용하므로, 버전 파일을 누적 보관해도 오래된 파일을 오인하지 않는다.
           mapfile -d '' changed_release_paths < <(
             git diff --name-only -z "$EVENT_BEFORE_SHA" "$EVENT_AFTER_SHA" -- releases/
           )
@@ -45,13 +35,11 @@ jobs:
             echo "No changed release files were found in this push." >&2
             exit 1
           fi
-
           for path in "${changed_release_paths[@]}"; do
             [[ -f "$path" ]] || continue
             base_name="${path##*/}"
             normalized="$(printf '%s' "$base_name" | normalize_name)"
             lower_name="$(printf '%s' "$base_name" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
-
             if [[ "$lower_name" == *.py && "$normalized" == *main* ]]; then
               main_candidates+=("$path")
             fi
@@ -59,66 +47,88 @@ jobs:
               spec_candidates+=("$path")
             fi
           done
-
-          if [[ ${#main_candidates[@]} -ne 1 ]]; then
-            echo "Expected exactly one main.py candidate under releases/, found ${#main_candidates[@]}." >&2
-            printf 'Candidates:\n%s\n' "${main_candidates[*]:-none}" >&2
+          if [[ ${#main_candidates[@]} -ne 1 || ${#spec_candidates[@]} -ne 1 ]]; then
+            echo "Expected exactly one main.py and one CandleView_API.txt candidate under releases/." >&2
+            printf 'Main candidates: %s\nSpec candidates: %s\n' "${main_candidates[*]:-none}" "${spec_candidates[*]:-none}" >&2
             exit 1
           fi
-          if [[ ${#spec_candidates[@]} -ne 1 ]]; then
-            echo "Expected exactly one CandleView_API.txt candidate under releases/, found ${#spec_candidates[@]}." >&2
-            printf 'Candidates:\n%s\n' "${spec_candidates[*]:-none}" >&2
-            exit 1
-          fi
-
           main_source="${main_candidates[0]}"
           spec_source="${spec_candidates[0]}"
-
+          bundle_dir="$(dirname "$main_source")"
+          if [[ "$(dirname "$spec_source")" != "$bundle_dir" ]]; then
+            echo "main.py and CandleView_API.txt must be changed in the same release bundle directory." >&2
+            exit 1
+          fi
           if [[ ! -s "$main_source" || ! -s "$spec_source" ]]; then
-            echo "Source files must not be empty." >&2
+            echo "Release main.py and CandleView_API.txt must not be empty." >&2
             exit 1
           fi
 
-          python3 -m py_compile "$main_source"
-          grep -q '^def run_phase1' "$main_source"
-          grep -q '^def run_phase2' "$main_source"
-          grep -q 'CANDLEVIEW_PROMPT_FULL' "$main_source"
+          # A release either remains a legacy pair or is an explicit FC-Next C-A
+          # bundle. The runtime import is the contract selector; a partial bundle fails.
+          fcnext_files=(
+            fc_next_core.py
+            fc_next_collection.py
+            fc_next_runtime.py
+            fc_next_telegram.py
+            fc_next_export.py
+            fc_next_jobs.py
+            FindCoin_FC_NEXT_C_A_CONTRACT.txt
+          )
+          promote_sources=("$main_source" "$spec_source")
+          promote_destinations=("main.py" "CandleView_API.txt")
+          if grep -q '^from fc_next_runtime import run_fc_next_ca_scan$' "$main_source"; then
+            for file in "${fcnext_files[@]}"; do
+              if [[ ! -s "$bundle_dir/$file" ]]; then
+                echo "FC-Next release is missing required bundle file: $file" >&2
+                exit 1
+              fi
+              promote_sources+=("$bundle_dir/$file")
+              promote_destinations+=("$file")
+            done
+            (
+              cd "$bundle_dir"
+              python3 -m py_compile main.py fc_next_core.py fc_next_collection.py fc_next_runtime.py fc_next_telegram.py fc_next_export.py fc_next_jobs.py
+              grep -q '^=== 14\. FindCoin FC-Next' FindCoin_FC_NEXT_C_A_CONTRACT.txt
+              grep -q 'Gemini를 호출하지 않는다' FindCoin_FC_NEXT_C_A_CONTRACT.txt
+              grep -q 'def start_fc_next_ca_job' main.py
+              ! grep -q 'run_findcoin(ex_name)' main.py
+            )
+          else
+            python3 -m py_compile "$main_source"
+            grep -q '^def run_phase1' "$main_source"
+            grep -q '^def run_phase2' "$main_source"
+            grep -q 'CANDLEVIEW_PROMPT_FULL' "$main_source"
+          fi
           grep -qi 'CandleView' "$spec_source"
           grep -q 'STAGE 0' "$spec_source"
 
-          cp "$main_source" .incoming_main.py
-          cp "$spec_source" .incoming_CandleView_API.txt
-          python3 -m py_compile .incoming_main.py
-
           changed=0
-          if ! cmp -s .incoming_main.py main.py; then
-            mv .incoming_main.py main.py
-            changed=1
-          else
-            rm .incoming_main.py
-          fi
-          if ! cmp -s .incoming_CandleView_API.txt CandleView_API.txt; then
-            mv .incoming_CandleView_API.txt CandleView_API.txt
-            changed=1
-          else
-            rm .incoming_CandleView_API.txt
-          fi
-
+          for index in "${!promote_sources[@]}"; do
+            source="${promote_sources[$index]}"
+            destination="${promote_destinations[$index]}"
+            incoming=".incoming_${destination}"
+            cp "$source" "$incoming"
+            if ! cmp -s "$incoming" "$destination"; then
+              mv "$incoming" "$destination"
+              changed=1
+            else
+              rm "$incoming"
+            fi
+          done
           if [[ "$changed" -eq 0 ]]; then
-            echo "Validated candidate pair already matches the deployed canonical files." >> "$GITHUB_STEP_SUMMARY"
+            echo "Validated release bundle already matches canonical files." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-
-          sha256sum main.py CandleView_API.txt | tee -a "$GITHUB_STEP_SUMMARY"
+          sha256sum "${promote_destinations[@]}" | tee -a "$GITHUB_STEP_SUMMARY"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add main.py CandleView_API.txt
-          git commit -m "chore: promote validated CandleView release files"
+          git add "${promote_destinations[@]}"
+          git commit -m "chore: promote validated CandleView release bundle"
           git push origin HEAD:main
-
           {
-            echo "## CandleView release promoted"
+            echo "## CandleView release bundle promoted"
             echo
-            echo "- Source main: \`$main_source\`"
-            echo "- Source specification: \`$spec_source\`"
+            echo "- Source bundle: \`$bundle_dir\`"
+            echo "- FC-Next bundle: \`$([[ ${#promote_destinations[@]} -gt 2 ]] && echo yes || echo no)\`"
           } >> "$GITHUB_STEP_SUMMARY"
