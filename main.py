@@ -13,6 +13,8 @@ import pandas as pd
 import requests
 from datetime import datetime, timedelta, timezone
 import backtest_framework
+from fc_next_runtime import run_fc_next_ca_scan
+from fc_next_jobs import ExchangeSingleFlight
 
 # ============================================================
 # 거래소 인식 — 검증된 3개로 고정 (V003 신뢰성 검증 결과 반영)
@@ -51,9 +53,9 @@ UNAUTHORIZED_INPUT_GUIDE = (
     "<b>지원 거래소</b>\n"
     "업비트(KRW) · 빗썸(KRW) · 코인베이스(USD)\n\n"
     "<b>🔎 FindCoin</b>\n"
-    "현재 시세분출 가능성이 높은 코인을 분석해서 Top3를 알려드립니다.\n"
+    "완료봉 기준 관측 스캔을 실행하고 State별 후보·수집 범위를 알려드립니다.\n"
     "/거래소 만 입력하면 실행됩니다. (예: /업비트)\n"
-    "(전종목 스캔이라 1~3분 정도 소요될 수 있습니다.)"
+    "(전종목 수집은 백그라운드에서 진행되며, 결과는 완료 후 전달됩니다.)"
 )
 
 
@@ -1715,6 +1717,28 @@ def send_telegram_message(chat_id, text, reply_markup=None, timeout=15):
         if reply_markup:
             payload["reply_markup"] = reply_markup
         requests.post(send_url, json=payload, timeout=timeout)
+
+
+def send_telegram_document(chat_id, filename, content_text, caption=None, timeout=30):
+    """Best-effort FindCoin export delivery; failure never blocks scan results."""
+    send_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
+    data = {"chat_id": chat_id}
+    if caption:
+        data["caption"] = caption
+    try:
+        res = requests.post(
+            send_url,
+            data=data,
+            files={"document": (filename, content_text.encode("utf-8"), "application/json")},
+            timeout=timeout,
+        )
+        try:
+            return bool(res.json().get("ok", False))
+        except Exception:
+            return res.status_code == 200
+    except Exception as exc:
+        print(f"[WARN] FindCoin Capture-Replay export 전송 실패: {type(exc).__name__}")
+        return False
 
 
 def answer_callback_query(callback_query_id, text=None):
@@ -3440,6 +3464,67 @@ def make_phase_keyboard(session_id):
     }
 
 
+FINDCOIN_JOB_COORDINATOR = ExchangeSingleFlight()
+
+
+def run_findcoin_next_ca(ex_name):
+    """Current-infrastructure FC-Next C-A scan: completed candles, no Gemini.
+
+    This boundary is FindCoin-only.  It neither reads nor writes CandleView
+    PHASE sessions and any exception is handled by the FindCoin command branch.
+    """
+    if ex_name not in SUPPORTED_EXCHANGES:
+        raise ValueError("unsupported FC-Next exchange")
+    quote = SUPPORTED_EXCHANGES[ex_name]["quote"]
+    exchange = getattr(ccxt, ex_name)({"enableRateLimit": True, "timeout": 8000})
+    return run_fc_next_ca_scan(exchange=exchange, exchange_id=ex_name, quote=quote)
+
+
+def _deliver_fc_next_ca_result(chat_ids, ex_name, fc_next):
+    """Send a completed FindCoin result without creating PHASE session state."""
+    rendered = fc_next["rendered"]
+    chunks = smart_chunk(rendered["text"], ["<b>1️⃣", "<b>2️⃣", "<b>3️⃣", "<b>4️⃣"])
+    export = fc_next["capture_replay_export"]
+    for target_chat_id in chat_ids:
+        for index, chunk in enumerate(chunks):
+            send_telegram_message(
+                target_chat_id,
+                chunk,
+                reply_markup=rendered.get("reply_markup") if index == len(chunks) - 1 else None,
+            )
+        exported = send_telegram_document(
+            target_chat_id,
+            export["filename"],
+            export["json_text"],
+            caption="FindCoin C-A Capture-Replay 원장용 snapshot export (Notion 수동 보관용)",
+        )
+        if not exported:
+            send_telegram_message(
+                target_chat_id,
+                "Capture-Replay export 파일 전송은 보류되었습니다. 이번 FindCoin 관측 결과와 상세 분석 버튼은 그대로 사용할 수 있습니다."
+            )
+
+
+def _deliver_fc_next_ca_failure(chat_ids, exc):
+    print(f"[WARN] FC-Next FindCoin background 실행 실패: {type(exc).__name__}")
+    for target_chat_id in chat_ids:
+        send_telegram_message(
+            target_chat_id,
+            "FindCoin 완료봉 관측 스캔을 이번 시점에 완료하지 못했습니다. CandleView 지정코인 분석 기능에는 영향이 없습니다. 잠시 후 다시 실행해 주세요."
+        )
+
+
+def start_fc_next_ca_job(chat_id, ex_name):
+    """Start or join one exchange-scoped C-A job without touching PHASE state."""
+    return FINDCOIN_JOB_COORDINATOR.start(
+        chat_id=chat_id,
+        exchange_id=ex_name,
+        run_job=lambda: run_findcoin_next_ca(ex_name),
+        deliver_result=lambda chat_ids, result: _deliver_fc_next_ca_result(chat_ids, ex_name, result),
+        deliver_failure=_deliver_fc_next_ca_failure,
+    )
+
+
 def make_findcoin_detail_keyboard(ex_name, top_symbols):
     """FindCoin 결과의 TOP1~3 상세분석 버튼. 코인명은 콜백데이터에만 싣고
     버튼 라벨은 순위만 표시한다(본문 파싱 리스크 최소화 + 간결한 UI)."""
@@ -3693,7 +3778,7 @@ while True:
                         "• /빗썸 리플\n"
                         "• /coinbase eth\n"
                         "• /업비트 비트코인 1d 4h 1h  (TF 직접 지정)\n\n"
-                        "[FindCoin — Top3 스크리닝]\n"
+                        "[FindCoin — 완료봉 관측 스캔]\n"
                         "• /업비트   또는   /coinbase\n\n"
                         "지원 거래소: 업비트 · 빗썸 · 코인베이스"
                     ),
@@ -3707,60 +3792,26 @@ while True:
                 continue
 
             if len(parts) == 1:
-                # 코인명 없이 거래소명만 → FindCoin 실행
+                # 코인명 없이 거래소명만 → FC-Next completed-candle full scan.
+                # This branch deliberately contains no Gemini call and does not
+                # create/read CandleView PHASE sessions.
                 ex_display_fc = SUPPORTED_EXCHANGES[ex_name]["kr_name"]
                 quote = SUPPORTED_EXCHANGES[ex_name]["quote"]
-                send_telegram_message(
-                    chat_id,
-                    f"🚨 시세분출 가능성이 높은 코인을 분석해서 Top3 를 알려드리는 🔎 FindCoin 이 실행되었습니다.\n"
-                    f"잠시만 기다려 주세요.\n\n"
-                    f"🔎 {ex_display_fc} 정보수집중...\n\n"
-                    f"거래소 응답속도에 따라 1 ~3분 정도 소요될수 있습니다."
-                )
-
-                result_text, n_total, n_valid, n_gate1, n_gate2, err, top_symbols, n_watch = run_findcoin(ex_name)
-
-                if err:
-                    send_telegram_message(chat_id, err)
-                    continue
-
-                watch_note = f"\n\n💡 참고내용\n데이터가 부족해 판정을 보류한 신규상장 코인 {n_watch}개 있음(배제 아님)" if n_watch > 0 else ""
-
-                if n_gate2 == 0:
-                    watch_line = f"\n💡 참고내용\n데이터가 부족해 판정을 보류한 신규상장 코인 {n_watch}개 있음(배제 아님)\n" if n_watch > 0 else ""
-                    scan_time_kst_watch = (datetime.now(timezone.utc) + timedelta(hours=9)).strftime("%Y-%m-%d %H:%M")
+                job_state = start_fc_next_ca_job(chat_id, ex_name)
+                if job_state == "joined":
                     send_telegram_message(
                         chat_id,
-                        f"🚨 FindCoin 코인 스캔 결과를 출력합니다.\n\n"
-                        f"🔎 스캔 결과 최종 합격코인 : {n_gate2} 개\n\n"
-                        f"대상 : {ex_display_fc} {quote} 마켓\n"
-                        f"스캔 시각: {scan_time_kst_watch} (KST)\n"
-                        f"총 스캔 종목: {n_total}개 (유효 {n_valid}개 / 관측대기 {n_watch}개)\n\n"
-                        f"🧭 스캔 단계별 현황\n"
-                        f"➔ 1차 경로 통과 {n_gate1}개\n"
-                        f"➔ 상세 판정 후보 {n_gate2}개\n"
-                        f"➔ 최종 합격 0개\n\n"
-                        f"✅️ 시장 상태 : 관망 국면\n\n"
-                        f"[관망 권고] 현재 {ex_display_fc} {quote} 마켓 내 경로A(Percentile ≥ 85% AND "
-                        f"RTM ≥ 3.0 AND Liquidity_Ratio ≥ 1.0) 및 경로B(변동폭 ≤ 5.0% AND "
-                        f"Liquidity_Ratio ≥ 1.0) 중 어느 쪽도 통과하지 못했거나, PA-VSA 옥석 검증·"
-                        f"손익비(R:R ≥ 2.0) 조건을 동시에 충족하는 고신뢰 분출 후보가 0개입니다. "
-                        f"억지 추격 진입을 지양하고 관망을 권고합니다.\n\n"
-                        f"[FindCoin 무결성 검증 완료]\n"
-                        f"■ API Direct Stream\n"
-                        f"■ Layer 7 감사 100% 통과\n"
-                        f"{watch_line}"
+                        f"🔎 {ex_display_fc} {quote} FindCoin 완료봉 관측 스캔이 이미 진행 중입니다. "
+                        "현재 스캔 결과가 완료되면 이 대화에도 같은 결과를 전달합니다."
                     )
-                    continue
-
-                fc_text = sanitize_html(result_text) + sanitize_html(watch_note)
-                header = f"<b>CandleView — FindCoin 스캔 결과</b>\n{ex_display_fc}\n\n"
-                full = header + fc_text
-                chunks = smart_chunk(full, FINDCOIN_BOUNDARY_MARKERS)
-                for i, chunk in enumerate(chunks):
-                    is_last = (i == len(chunks) - 1)
-                    reply_markup = make_findcoin_detail_keyboard(ex_name, top_symbols) if (is_last and top_symbols) else None
-                    send_telegram_message(chat_id, chunk, reply_markup=reply_markup)
+                else:
+                    send_telegram_message(
+                        chat_id,
+                        f"🔎 <b>FindCoin 완료봉 관측 스캔</b>을 시작했습니다.\n\n"
+                        f"대상: {ex_display_fc} {quote} FC-0 유니버스\n"
+                        f"완료 일봉을 수집하고 State별 관측 결과와 데이터 범위를 발행합니다.\n"
+                        f"스캔은 백그라운드에서 진행되므로 CandleView 지정코인 분석은 계속 사용할 수 있습니다."
+                    )
                 continue
 
             sym_name = parts[1]
