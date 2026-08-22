@@ -1,0 +1,159 @@
+=== 14. FindCoin FC-Next 플러그인 모듈 (C-A 완료봉 관측 스캔) ===
+
+(CandleView_API 본체에 종속된 선택적 플러그인. 사용자가 거래소명만 명시할 때 실행하며, 본체 PHASE 1/2와 별도 실행·실패 경계를 갖는다.)
+
+═══════════════════════════════════════════════════════════════
+0. 목적·비목적·불변 경계
+═══════════════════════════════════════════════════════════════
+
+1. 목적: 지정 거래소의 단일 quote market에서, 분석 시점 이후 상대적 가격 강세 가능성을 측정하기 위한 완료봉 기반 관측 snapshot을 만든다. 이 모듈은 결과를 설명 가능한 State 관측 순서로 표시하고, 이후 24h·72h·168h outcome과 비교할 수 있는 불변 원장을 생성한다.
+
+2. 비목적: 본 모듈은 주문·거래 기능, 매수·매도 지시, 손익 약속, 성과 보장, 전역 Top3 강제 선별을 제공하지 않는다. `qualified` 또는 고확신 표기는 outcome cohort 검증 전까지 비활성이다.
+
+3. 본체 격리: FindCoin job은 CandleView의 `analysis_sessions`, PHASE 1 원천, PHASE 2 재구성 입력을 읽거나 쓰지 않는다. FindCoin 수집·원장 export·Telegram document 전송의 실패는 FindCoin 결과에만 표시하며, 지정코인 분석을 중단시키지 않는다.
+
+4. 상세 분석 경계: 관측 후보의 상세 버튼은 `fc_detail|exchange|symbol`만 전달한다. State, rank, P0, snapshot ID, outcome, 관측 시각은 callback payload에 넣지 않는다. 클릭 시에는 그 시점의 새 CandleView PHASE 1만 실행한다.
+
+═══════════════════════════════════════════════════════════════
+1. FC-0 유니버스·시점·완료봉 계약
+═══════════════════════════════════════════════════════════════
+
+1. 유니버스: 거래소 `active=True`, spot, 지정 quote market의 전체 심볼을 market metadata에서 먼저 고정한다. inactive·non-spot·스테이블코인 base는 `excluded` 사유와 함께 manifest에 기록한다. 이 시점 이후 State·rank·P0·outcome은 이 manifest를 바꾸지 않는다.
+
+2. 수집 상태: manifest의 각 심볼은 `available`, `limited`, `deferred`, `unavailable` 중 하나의 상태를 가진다. API timeout, internal timestamp gap, rate-limit, time budget 만료, 신규 상장 데이터 부족은 심볼을 삭제하거나 0점으로 바꾸지 않고 reason code로 기록한다.
+
+3. 완료봉: 모든 State·rank feature에는 `complete=True`인 OHLCV만 쓴다. 수집 시각 `T_collect`에 대해 timeframe 길이가 Δ인 candle은 `open_timestamp + Δ ≤ T_collect`일 때만 완료봉이다. 진행봉의 고가·종가·거래량은 State 확정, support, rank, 성과 기준에 사용하지 않는다.
+
+4. 시계열 무결성: 동일 timeframe 내 timestamp가 비단조·중복·internal gap이거나 OHLCV의 `high < max(open, close)`, `low > min(open, close)`, 음수 volume 등 정의역 위반이면 해당 timeframe은 unavailable로 기록한다. 결손을 압축하거나 가상의 candle로 보정하지 않는다.
+
+5. 주봉: 1w는 완료 일봉을 UTC Monday 기준 7일 bucket으로 집계한다. 첫 partial week와 최신 partial week는 조용히 제외하며, 중간 bucket의 일자 결손은 `WEEKLY_INTERNAL_GAP`으로 기록한다. 완전 7일 bucket만 weekly State 입력이다.
+
+6. BTC 기준: 동일 거래소·동일 quote의 BTC 완료 일봉을 별도 수집한다. candidate와 BTC의 동일 timestamp 두 점이 모두 있어야 해당 lookback 상대강도를 계산한다. timestamp alignment가 없으면 상대강도는 0이 아니라 unavailable이다.
+
+═══════════════════════════════════════════════════════════════
+2. FC-1 완료봉 feature와 State 관측
+═══════════════════════════════════════════════════════════════
+
+공통 설정은 feature contract version과 함께 snapshot에 저장한다. 현재 C-A 설정은 daily window `W=40`, intraday window `I=12`, support confirmation `k=2`, State1 peer group 최소 3이다. 이 값은 predictive superiority의 증거가 아니며, 변경 시 새 contract version과 새 cohort가 필요하다.
+
+[State1 — 응축·상단 안정]
+
+최근 W개의 완료 일봉에서 다음 값을 계산한다.
+
+```text
+box_width = (max(high) - min(low)) / median(close)
+range_position = (close_t - min(low)) / (max(high) - min(low))
+RS_7 = log(close_t / close_{t-7}) - log(BTC_t / BTC_{t-7})
+liquidity = median(close × volume)
+```
+
+동일 snapshot·거래소의 비교 가능 record가 3개 이상일 때만 box compression empirical percentile을 계산한다. State1은 응축 percentile, range_position, finite liquidity 조건을 만족하는 완료봉 관측이다. peer group이 부족하거나 BTC alignment가 없으면 `pending_data`이다.
+
+[State2 — 완료 종가 구조 돌파]
+
+현재 완료 일봉을 `t`, 직전 W개 완료 일봉의 high 최대를 `H_prior`라 한다.
+
+```text
+breakout_confirmed = 1[close_t > H_prior]
+body_ratio = |close_t - open_t| / (high_t - low_t)
+volume_ratio = volume_t / median(volume_{t-W} ... volume_{t-1})
+extension = (close_t - H_prior) / median(true_range_{t-W} ... true_range_{t-1})
+RS_7 = candidate log return - BTC matching-timestamp log return
+```
+
+분모가 0이거나 finite하지 않으면 해당 feature는 unavailable이며 State2는 `pending_data`이다. 조건을 계산할 수 있으나 `breakout_confirmed=0`이면 `not_matched`이다. 진행봉의 돌파 시도는 State2로 확정하지 않는다.
+
+[State3 — 상위 맥락 안의 완료 인트라데이 조정]
+
+State3의 일봉 support는 외부 주입값이 아니라 완료 일봉 pivot low로 결정한다. 최근 W 완료 일봉에서 index `j`는 양쪽 k개 완료봉이 있을 때 다음을 만족하면 pivot이다.
+
+```text
+PivotLow_j = 1[L_j < min(L_{j-k} ... L_{j-1})
+               and L_j ≤ min(L_{j+1} ... L_{j+k})]
+support_t = max{L_j | PivotLow_j=1 and L_j ≤ close_t}
+```
+
+동률 low는 가장 이른 pivot 하나만 인정한다. support가 없거나 일봉 W개·완전 주봉 6개·인트라데이 I개가 부족하면 State3은 `pending_data`다.
+
+모든 선행 데이터가 있을 때,
+
+```text
+weekly_trend = 1[weekly_close_t > weekly_close_{t-4}
+                 and weekly_close_{t-1} > weekly_close_{t-5}]
+daily_context = 1[daily_close_t > median(last W daily closes)]
+pullback_range = (max(intraday_high) - intraday_close_t)
+                 / (max(intraday_high) - min(intraday_low))
+pullback_hold = 1[intraday_close_t ≥ support_t]
+RS_14 = candidate log return - BTC matching-timestamp log return
+```
+
+State3은 `weekly_trend`, `daily_context`, `pullback_hold`가 모두 참인 완료봉 관측이다. 인트라데이 수집은 일봉·주봉·support 선행 데이터가 존재하는 심볼에만 lazy 수행한다. 선행 데이터 부족으로 intraday를 생략해도 심볼은 manifest·coverage에 남는다.
+
+[State 중첩·primary State]
+
+State는 상호 배타적이지 않다. 한 심볼이 복수 State를 만족하면 모든 `state_flags`와 각 State 내 rank를 보존한다. Telegram primary State는 `S2 > S3 > S1` 순서로 하나만 표시한다. 이 순서는 관측 표시를 위한 결정이며 performance claim이 아니다.
+
+═══════════════════════════════════════════════════════════════
+3. FC-2 결정론 rank·결손·P0
+═══════════════════════════════════════════════════════════════
+
+1. rank는 State 간 합산 점수나 전역 Top3가 아니라 동일 State 안에서만 계산한다. 동점은 심볼 오름차순으로 고정한다. 미래 outcome, LLM 문장, 주관적 설명, P0, orderbook, trade side는 State 또는 rank 입력에 사용하지 않는다.
+
+2. State1 rank는 compression percentile, range position, RS_7 percentile, liquidity percentile 순이다. State2 rank는 body_ratio, volume_ratio percentile, RS_7 percentile, liquidity percentile 순이다. State3 rank는 RS_14 percentile, pullback_hold, daily_context, pullback_range의 State3 중앙값 근접성, liquidity percentile 순이다.
+
+3. P0는 State/rank feature 수집이 끝난 뒤 fresh public client의 bulk ticker로 관측한다. 유효 `bid ≤ ask`이면 `P0=(bid+ask)/2`, crossed book이면 midpoint를 금지하고 valid `last`만 fallback으로 쓴다. 값이 없으면 `P0_UNAVAILABLE`이며 0·직전 종가·임의값으로 대체하지 않는다. primary fresh client가 실패한 경우에만, 남은 P0 time budget에서 request timeout을 다시 계산해 한 번 재시도할 수 있다. P0는 여전히 State/rank 입력이 아니다.
+
+4. P0 상태는 `mid_available`, `last_fallback`, `unavailable`, `not_attempted`를 구분한다. `p0_symbols_attempted`에는 실제 bulk ticker API가 호출된 심볼만 기록한다. 일봉 feature가 없으면 `P0_NOT_ATTEMPTED`, ticker 단계가 time budget 전 종료되면 `P0_NOT_ATTEMPTED_TIME_BUDGET`으로 남긴다. `not_attempted`는 `P0_UNAVAILABLE`과 중복 기록하지 않는다.
+
+═══════════════════════════════════════════════════════════════
+4. FC-3 비차단 Telegram 결과·실행 경계
+═══════════════════════════════════════════════════════════════
+
+1. `/거래소` 명령은 exchange별 single-flight FindCoin background job을 시작한다. 동일 exchange의 진행 중 요청은 새 API scan을 만들지 않고 기존 job 결과 delivery에 join한다. FindCoin job은 Telegram long-poll update handler에서 동기 API 수집을 하지 않는다.
+
+2. collector는 exchange별 bounded worker와 wall-clock time budget을 쓴다. 운영 설정은 daily·intraday·P0의 명시적 단계 예산을 둘 수 있으며, 세 값은 전체 time budget과 정확히 일치해야 한다. collector 시작은 market metadata 이전이며, 각 network request는 `min(request_timeout_cap, stage deadline - now - cleanup guard)`를 timeout으로 받는다. 남은 시간이 minimum request timeout과 cleanup guard보다 작으면 새 request를 시작하지 않고 나머지 심볼을 deferred로 기록한다. 따라서 이미 시작된 batch가 default transport timeout으로 stage deadline을 지나 대기하는 것을 금지한다. time budget 이후 미수집 심볼은 `COLLECTION_DEFERRED_TIME_BUDGET` 또는 `INTRADAY_DEFERRED_TIME_BUDGET`으로 기록되고 partial ScanResult가 발행된다. 이는 결과 실패가 아니다.
+
+3. 결과 화면은 반드시 다음을 포함한다.
+
+```text
+CandleView — FindCoin 완료봉 관측
+거래소 · quote · scan finished UTC · 수집 기준 버전
+전체 기준 목록 / 일봉 마감 데이터 확보 / 이번 계산 미반영 수
+S1·S2·S3 각각의 pending 수와 all-state pending 수 (any-state diagnostic을 전체 실패처럼 표시 금지)
+쉬운 설명의 완료봉 관측 후보와 해당 유형 안의 순서; raw observed 수와 화면 상위 표시 수의 구분
+고확신·성과 우위 비활성 상태
+State3 intraday coverage, P0 valid/not-attempted/unavailable, 데이터 제한·상세 차트 분석 안내
+```
+
+4. 관측 후보가 0개여도 coverage와 제한 사유를 쉬운 문장으로 발행한다. renderer는 State/rank·coverage·P0를 재계산하거나 detail callback payload를 바꾸지 않는다. 수집·P0·Capture-Replay export 실패는 결과 화면·상세 버튼을 막지 않는다.
+
+5. FindCoin은 Gemini를 호출하지 않는다. State·rank·renderer·export는 Python 결정론 처리이며, 따라서 full scan의 유니버스 수가 Gemini token 사용량을 증가시키지 않는다.
+
+═══════════════════════════════════════════════════════════════
+5. FC-4 Capture-Replay C-A 원장
+═══════════════════════════════════════════════════════════════
+
+1. C-A에서는 snapshot을 JSON document로 best-effort 전달해 Notion에 수동 보관한다. document 전송 실패는 `ledger_not_saved`와 구분되는 delivery failure이며 scan 결과는 유지한다.
+
+2. export에는 관측 후보만이 아니라 전체 manifest, excluded/deferred 사유, coverage, feature contract, config, 모든 observation, P0 provenance, snapshot ID를 보존한다. 비후보·결손·P0 not-attempted·P0 unavailable을 제거하면 선택 편향이 생기므로 금지한다. valid P0가 없는 observation은 P0 기반 outcome cohort에 넣지 않는다.
+
+3. outcome schedule은 scan 완료 시각을 기준으로 24h, 72h, 168h다. 가격이 available이면 `R_h=P_h/P0-1`을 기록하며, P0 또는 outcome이 없으면 0으로 치환하지 않고 `unavailable`, `absolute_only`, `stale`, `delisted` 중 해당 상태를 남긴다. BTC relative return과 universe relative return도 matching timestamp가 있을 때만 계산한다.
+
+4. 최소 30개 연속 snapshot cohort와 168h 종료 전에는 고확신/우위/성능 주장을 활성화하지 않는다. contract 또는 rank policy가 변경되면 새 cohort로 분리한다.
+
+═══════════════════════════════════════════════════════════════
+6. FC-5 무결성 검증·운영 제한
+═══════════════════════════════════════════════════════════════
+
+출력 전 다음을 확인한다.
+
+1. manifest가 State/rank/P0 이전에 고정됐는가?
+2. State 입력이 completed OHLCV만 사용했는가?
+3. timeframe gap, timestamp, OHLCV 정의역, zero denominator를 reason code로 기록했는가?
+4. State/rank에 future outcome, P0, LLM, 선택적 live microdata가 들어가지 않았는가?
+5. partial·data-limited·candidate 0 상태에서도 결과가 발행되는가?
+6. detail callback이 exchange와 symbol 외 FindCoin context를 전달하지 않는가?
+7. Capture-Replay export가 실패해도 Telegram 결과와 일반 CandleView 분석이 유지되는가?
+8. 고확신 label이 비활성이고 성과 보장을 포함하지 않는가?
+
+C-A 운영 제한: in-memory background job은 restart recovery·durable queue·자동 outcome collector를 제공하지 않는다. restart 뒤 Telegram document로 전달된 immutable snapshot만 C-A cohort에 기록한다. durable DB, restart recovery, 자동 24/72/168h collector는 별도 C-B 승인 범위다.
