@@ -16,14 +16,23 @@ from fc_next_export import build_capture_replay_export
 from fc_next_telegram import render_scan_result
 
 
-# Conservative C-A defaults: public market-data calls remain below the known
-# UPBIT/Coinbase per-second public limits, while a result is still published as
-# partial if the wall-clock budget is exhausted.  BITHUMB uses the lower default
-# until its production-like smoke timing is separately verified.
+# The daily stage, lazy State3 intraday stage, and P0 provenance stage have
+# separate launch boundaries.  Each request receives a remaining-time-aware
+# transport timeout and P0 starts from a fresh public client, so an in-flight
+# request cannot retain the default 8-second timeout past its stage deadline.
 CURRENT_INFRA_COLLECTION_CONFIG = {
-    "upbit": CollectionConfig(max_workers=8, time_budget_seconds=90),
-    "bithumb": CollectionConfig(max_workers=4, time_budget_seconds=90),
-    "coinbase": CollectionConfig(max_workers=4, time_budget_seconds=90),
+    "upbit": CollectionConfig(
+        max_workers=8, time_budget_seconds=120,
+        daily_time_budget_seconds=94, intraday_time_budget_seconds=18, p0_time_budget_seconds=8,
+    ),
+    "bithumb": CollectionConfig(
+        max_workers=4, time_budget_seconds=120,
+        daily_time_budget_seconds=90, intraday_time_budget_seconds=18, p0_time_budget_seconds=12,
+    ),
+    "coinbase": CollectionConfig(
+        max_workers=4, time_budget_seconds=120,
+        daily_time_budget_seconds=90, intraday_time_budget_seconds=18, p0_time_budget_seconds=12,
+    ),
 }
 
 

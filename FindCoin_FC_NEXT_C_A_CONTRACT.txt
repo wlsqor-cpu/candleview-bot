@@ -101,9 +101,9 @@ State는 상호 배타적이지 않다. 한 심볼이 복수 State를 만족하�
 
 2. State1 rank는 compression percentile, range position, RS_7 percentile, liquidity percentile 순이다. State2 rank는 body_ratio, volume_ratio percentile, RS_7 percentile, liquidity percentile 순이다. State3 rank는 RS_14 percentile, pullback_hold, daily_context, pullback_range의 State3 중앙값 근접성, liquidity percentile 순이다.
 
-3. P0는 State/rank feature 수집이 끝난 뒤 bulk ticker로 한 번 관측한다. 유효 `bid ≤ ask`이면 `P0=(bid+ask)/2`, crossed book이면 midpoint를 금지하고 valid `last`만 fallback으로 쓴다. 값이 없으면 `P0_UNAVAILABLE`이며 0·직전 종가·임의값으로 대체하지 않는다.
+3. P0는 State/rank feature 수집이 끝난 뒤 fresh public client의 bulk ticker로 관측한다. 유효 `bid ≤ ask`이면 `P0=(bid+ask)/2`, crossed book이면 midpoint를 금지하고 valid `last`만 fallback으로 쓴다. 값이 없으면 `P0_UNAVAILABLE`이며 0·직전 종가·임의값으로 대체하지 않는다. primary fresh client가 실패한 경우에만, 남은 P0 time budget에서 request timeout을 다시 계산해 한 번 재시도할 수 있다. P0는 여전히 State/rank 입력이 아니다.
 
-4. P0 상태는 `mid_available`, `last_fallback`, `unavailable`, `not_attempted`를 구분한다. 일봉 feature가 없거나 time budget으로 deferred된 심볼은 ticker를 시도하지 않고 `P0_NOT_ATTEMPTED`로 남긴다.
+4. P0 상태는 `mid_available`, `last_fallback`, `unavailable`, `not_attempted`를 구분한다. `p0_symbols_attempted`에는 실제 bulk ticker API가 호출된 심볼만 기록한다. 일봉 feature가 없으면 `P0_NOT_ATTEMPTED`, ticker 단계가 time budget 전 종료되면 `P0_NOT_ATTEMPTED_TIME_BUDGET`으로 남긴다. `not_attempted`는 `P0_UNAVAILABLE`과 중복 기록하지 않는다.
 
 ═══════════════════════════════════════════════════════════════
 4. FC-3 비차단 Telegram 결과·실행 경계
@@ -111,20 +111,21 @@ State는 상호 배타적이지 않다. 한 심볼이 복수 State를 만족하�
 
 1. `/거래소` 명령은 exchange별 single-flight FindCoin background job을 시작한다. 동일 exchange의 진행 중 요청은 새 API scan을 만들지 않고 기존 job 결과 delivery에 join한다. FindCoin job은 Telegram long-poll update handler에서 동기 API 수집을 하지 않는다.
 
-2. collector는 exchange별 bounded worker와 wall-clock time budget을 쓴다. time budget 이후 미수집 심볼은 `COLLECTION_DEFERRED_TIME_BUDGET` 또는 `INTRADAY_DEFERRED_TIME_BUDGET`으로 기록되고 partial ScanResult가 발행된다. 이는 결과 실패가 아니다.
+2. collector는 exchange별 bounded worker와 wall-clock time budget을 쓴다. 운영 설정은 daily·intraday·P0의 명시적 단계 예산을 둘 수 있으며, 세 값은 전체 time budget과 정확히 일치해야 한다. collector 시작은 market metadata 이전이며, 각 network request는 `min(request_timeout_cap, stage deadline - now - cleanup guard)`를 timeout으로 받는다. 남은 시간이 minimum request timeout과 cleanup guard보다 작으면 새 request를 시작하지 않고 나머지 심볼을 deferred로 기록한다. 따라서 이미 시작된 batch가 default transport timeout으로 stage deadline을 지나 대기하는 것을 금지한다. time budget 이후 미수집 심볼은 `COLLECTION_DEFERRED_TIME_BUDGET` 또는 `INTRADAY_DEFERRED_TIME_BUDGET`으로 기록되고 partial ScanResult가 발행된다. 이는 결과 실패가 아니다.
 
 3. 결과 화면은 반드시 다음을 포함한다.
 
 ```text
-CandleView — FindCoin 관측 스캔
-거래소 · quote · scan finished UTC · feature contract version
-FC-0 universe total / basic completed OHLCV / data-limited / State pending
-State2, State3, State1별 완료봉 관측 후보와 State 내 rank
-고확신 라벨 비활성 상태
-데이터 제한·상세 차트 분석 안내
+CandleView — FindCoin 완료봉 관측
+거래소 · quote · scan finished UTC · 수집 기준 버전
+전체 기준 목록 / 일봉 마감 데이터 확보 / 이번 계산 미반영 수
+S1·S2·S3 각각의 pending 수와 all-state pending 수 (any-state diagnostic을 전체 실패처럼 표시 금지)
+쉬운 설명의 완료봉 관측 후보와 해당 유형 안의 순서; raw observed 수와 화면 상위 표시 수의 구분
+고확신·성과 우위 비활성 상태
+State3 intraday coverage, P0 valid/not-attempted/unavailable, 데이터 제한·상세 차트 분석 안내
 ```
 
-4. 관측 후보가 0개여도 coverage, 제한 code, `pending_data` 상태를 발행한다. 수집·P0·Capture-Replay export 실패는 결과 화면·상세 버튼을 막지 않는다.
+4. 관측 후보가 0개여도 coverage와 제한 사유를 쉬운 문장으로 발행한다. renderer는 State/rank·coverage·P0를 재계산하거나 detail callback payload를 바꾸지 않는다. 수집·P0·Capture-Replay export 실패는 결과 화면·상세 버튼을 막지 않는다.
 
 5. FindCoin은 Gemini를 호출하지 않는다. State·rank·renderer·export는 Python 결정론 처리이며, 따라서 full scan의 유니버스 수가 Gemini token 사용량을 증가시키지 않는다.
 
@@ -134,7 +135,7 @@ State2, State3, State1별 완료봉 관측 후보와 State 내 rank
 
 1. C-A에서는 snapshot을 JSON document로 best-effort 전달해 Notion에 수동 보관한다. document 전송 실패는 `ledger_not_saved`와 구분되는 delivery failure이며 scan 결과는 유지한다.
 
-2. export에는 관측 후보만이 아니라 전체 manifest, excluded/deferred 사유, coverage, feature contract, config, 모든 observation, P0 provenance, snapshot ID를 보존한다. 비후보·결손·P0 unavailable을 제거하면 선택 편향이 생기므로 금지한다.
+2. export에는 관측 후보만이 아니라 전체 manifest, excluded/deferred 사유, coverage, feature contract, config, 모든 observation, P0 provenance, snapshot ID를 보존한다. 비후보·결손·P0 not-attempted·P0 unavailable을 제거하면 선택 편향이 생기므로 금지한다. valid P0가 없는 observation은 P0 기반 outcome cohort에 넣지 않는다.
 
 3. outcome schedule은 scan 완료 시각을 기준으로 24h, 72h, 168h다. 가격이 available이면 `R_h=P_h/P0-1`을 기록하며, P0 또는 outcome이 없으면 0으로 치환하지 않고 `unavailable`, `absolute_only`, `stale`, `delisted` 중 해당 상태를 남긴다. BTC relative return과 universe relative return도 matching timestamp가 있을 때만 계산한다.
 

@@ -56,6 +56,8 @@ def build_capture_replay_export(scan_result: Mapping[str, Any]) -> dict[str, Any
         f"- Feature contract: `{snapshot.get('feature_contract_version', '')}`",
         f"- Universe hash: `{snapshot.get('universe_hash', '')}`",
         f"- Coverage: total `{export['coverage'].get('universe_total', 0)}`, basic OHLCV `{export['coverage'].get('basic_ohlcv', 0)}`, data-limited `{export['coverage'].get('data_limited', 0)}`",
+        f"- State pending: S1 `{export['coverage'].get('s1_pending', 0)}`, S2 `{export['coverage'].get('s2_pending', 0)}`, S3 `{export['coverage'].get('s3_pending', 0)}`, all-state `{export['coverage'].get('all_states_pending', export['coverage'].get('state_pending', 0))}`",
+        f"- P0 baseline: valid `{export['coverage'].get('p0_valid', 0)}`, not attempted `{export['coverage'].get('p0_not_attempted', 0)}`, unavailable `{export['coverage'].get('p0_unavailable', 0)}`",
         "- High-confidence label: disabled; this record is an observation snapshot.",
         "",
         "## Manual outcome schedule",
@@ -69,7 +71,7 @@ def build_capture_replay_export(scan_result: Mapping[str, Any]) -> dict[str, Any
         "",
         "## Recording rule",
         "",
-        "Store the attached JSON without removing non-candidates, data-limited symbols, deferred symbols, or P0-unavailable observations. Record outcome availability as `available`, `absolute_only`, `stale`, `unavailable`, or `delisted`; never replace a missing outcome with zero.",
+        "Store the attached JSON without removing non-candidates, data-limited symbols, deferred symbols, P0-not-attempted observations, or P0-unavailable observations. Only observations with a valid P0 baseline can enter a P0-based return cohort. Record outcome availability as `available`, `absolute_only`, `stale`, `unavailable`, or `delisted`; never replace a missing outcome with zero.",
     ])
     snapshot_id = str(snapshot.get("snapshot_id") or "unknown")
     return {

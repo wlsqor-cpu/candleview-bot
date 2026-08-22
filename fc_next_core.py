@@ -490,7 +490,14 @@ def scan_completed_candles(scan_input: Mapping[str, Any], config: ScanConfig | N
     basic_ohlcv_count = sum(record["module_status"]["daily"] == "available" for record in observations)
     display_candidates = [record for record in observations if record["display_tier"] == "observed"]
     limited_count = len(observations) - basic_ohlcv_count
-    snapshot_status = "complete" if basic_ohlcv_count == len(observations) and benchmark_error is None else ("limited" if basic_ohlcv_count else "data_unavailable")
+    # An empty manifest can arise when the strict wall-clock policy declines to
+    # start market metadata.  Zero equals zero arithmetically, but it is not a
+    # complete scan and must never receive a `complete` status.
+    snapshot_status = (
+        "complete"
+        if observations and basic_ohlcv_count == len(observations) and benchmark_error is None
+        else ("limited" if basic_ohlcv_count else "data_unavailable")
+    )
     collection_manifest = dict(scan_input.get("collection_manifest") or {})
     snapshot_errors: list[str] = list(collection_manifest.get("manifest_error_codes") or [])
     if benchmark_error:
@@ -509,6 +516,31 @@ def scan_completed_candles(scan_input: Mapping[str, Any], config: ScanConfig | N
         "universe_hash": universe_hash,
     }
     snapshot_id = sha256(json.dumps(snapshot_seed, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+    pending_by_state = {
+        state: sum(record["state_status"].get(state) == "pending_data" for record in observations)
+        for state in ("S1", "S2", "S3")
+    }
+    any_state_pending = sum(
+        any(value == "pending_data" for value in record["state_status"].values())
+        for record in observations
+    )
+    all_states_pending = sum(
+        all(value == "pending_data" for value in record["state_status"].values())
+        for record in observations
+    )
+    observed_by_primary_state = {
+        state: sum(record.get("primary_state") == state for record in display_candidates)
+        for state in ("S1", "S2", "S3")
+    }
+    p0_valid_count = sum(record.get("p0") is not None for record in observations)
+    p0_not_attempted_count = sum(
+        (record.get("live_observation") or {}).get("p0_status") == "not_attempted"
+        for record in observations
+    )
+    p0_unavailable_count = sum(
+        (record.get("live_observation") or {}).get("p0_status") == "unavailable"
+        for record in observations
+    )
     return {
         "schema_version": SCHEMA_VERSION,
         "feature_contract_version": FEATURE_CONTRACT_VERSION,
@@ -542,8 +574,21 @@ def scan_completed_candles(scan_input: Mapping[str, Any], config: ScanConfig | N
             "universe_total": len(observations),
             "basic_ohlcv": basic_ohlcv_count,
             "data_limited": limited_count,
+            # observation_candidates remains the raw observed count before the
+            # Telegram per-state display cap; it is not a rank or filter input.
             "observation_candidates": len(display_candidates),
-            "state_pending": sum(any(value == "pending_data" for value in record["state_status"].values()) for record in observations),
+            "observed_by_primary_state": observed_by_primary_state,
+            "s1_pending": pending_by_state["S1"],
+            "s2_pending": pending_by_state["S2"],
+            "s3_pending": pending_by_state["S3"],
+            "any_state_pending": any_state_pending,
+            "all_states_pending": all_states_pending,
+            "p0_valid": p0_valid_count,
+            "p0_not_attempted": p0_not_attempted_count,
+            "p0_unavailable": p0_unavailable_count,
+            # Compatibility alias for older exports; UI must not present this
+            # any-state diagnostic as if every State were unavailable.
+            "state_pending": any_state_pending,
         },
         "observations": observations,
         "display_candidates": sorted(display_candidates, key=lambda item: ({"S2": 0, "S3": 1, "S1": 2}[item["primary_state"]], item["rank_within_state"], item["symbol"])),

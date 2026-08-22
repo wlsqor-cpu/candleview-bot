@@ -34,6 +34,18 @@ class CollectionConfig:
     # None means no wall-clock cutoff.  A cutoff emits deferred manifest rows
     # rather than cancelling the entire nonblocking FindCoin result.
     time_budget_seconds: float | None = None
+    # Optional fixed stage boundaries measured from scan start.  When supplied,
+    # all three must sum exactly to time_budget_seconds so daily collection does
+    # not silently consume time reserved for State3 and P0 provenance.
+    daily_time_budget_seconds: float | None = None
+    intraday_time_budget_seconds: float | None = None
+    p0_time_budget_seconds: float | None = None
+    # A request is never allowed to retain the default transport timeout when
+    # less time remains in its stage.  The guard is reserved for worker cleanup
+    # and deterministic result rendering after the final network call.
+    request_timeout_cap_seconds: float = 8.0
+    deadline_guard_seconds: float = 1.0
+    minimum_request_timeout_seconds: float = 1.0
 
 
 def _as_epoch_ms(value: Any) -> int:
@@ -188,7 +200,11 @@ def _fetch_tickers_after_features(exchange: Any, symbols: list[str]) -> tuple[di
 def _live_observation_from_ticker(ticker: Mapping[str, Any] | None, observed_at_ms: int) -> tuple[dict[str, Any], list[str], str]:
     """Keep P0 provenance separate from completed feature collection."""
     if not isinstance(ticker, Mapping):
-        return {"observed_at_utc": _iso_utc(observed_at_ms), "source": "bulk_ticker"}, ["TICKER_UNAVAILABLE", "P0_UNAVAILABLE"], "unavailable"
+        return {
+            "observed_at_utc": _iso_utc(observed_at_ms),
+            "source": "bulk_ticker",
+            "p0_status": "unavailable",
+        }, ["TICKER_UNAVAILABLE", "P0_UNAVAILABLE"], "unavailable"
     def number_or_none(value: Any) -> float | None:
         try:
             parsed = float(value)
@@ -251,32 +267,94 @@ def collect_fc0_completed_data(
         raise ValueError("collection max_workers must be at least 1")
     if config.time_budget_seconds is not None and config.time_budget_seconds <= 0:
         raise ValueError("collection time_budget_seconds must be positive when provided")
+    if config.request_timeout_cap_seconds <= 0:
+        raise ValueError("request_timeout_cap_seconds must be positive")
+    if config.deadline_guard_seconds < 0:
+        raise ValueError("deadline_guard_seconds must not be negative")
+    if config.minimum_request_timeout_seconds <= 0:
+        raise ValueError("minimum_request_timeout_seconds must be positive")
+    if config.minimum_request_timeout_seconds > config.request_timeout_cap_seconds:
+        raise ValueError("minimum_request_timeout_seconds must not exceed request_timeout_cap_seconds")
+    stage_budgets = (
+        config.daily_time_budget_seconds,
+        config.intraday_time_budget_seconds,
+        config.p0_time_budget_seconds,
+    )
+    if any(value is not None and value <= 0 for value in stage_budgets):
+        raise ValueError("stage time budgets must be positive when provided")
+    if any(value is not None for value in stage_budgets):
+        if any(value is None for value in stage_budgets):
+            raise ValueError("daily, intraday, and p0 time budgets must be supplied together")
+        if config.time_budget_seconds is None:
+            raise ValueError("stage time budgets require time_budget_seconds")
+        if abs(sum(float(value) for value in stage_budgets) - float(config.time_budget_seconds)) > 1e-9:
+            raise ValueError("stage time budgets must sum exactly to time_budget_seconds")
     scan_started_ms = _as_epoch_ms(scan_started_at_utc)
     collected_ms = _as_epoch_ms(collected_at_utc)
     if collected_ms < scan_started_ms:
         raise ValueError("collected_at must not precede scan_started")
-    included, excluded, _markets, manifest_errors = _manifest(exchange, quote)
-    all_symbols = [item["symbol"] for item in included]
+    # The wall-clock begins before market metadata.  A slow metadata request is
+    # part of the user-visible scan and must not become uncounted extra time.
+    scan_started_monotonic = time.monotonic()
+    overall_deadline_monotonic = (
+        scan_started_monotonic + float(config.time_budget_seconds)
+        if config.time_budget_seconds is not None else None
+    )
+    if all(value is not None for value in stage_budgets):
+        daily_deadline_monotonic = scan_started_monotonic + float(config.daily_time_budget_seconds)
+        intraday_deadline_monotonic = daily_deadline_monotonic + float(config.intraday_time_budget_seconds)
+        p0_deadline_monotonic = intraday_deadline_monotonic + float(config.p0_time_budget_seconds)
+    else:
+        daily_deadline_monotonic = overall_deadline_monotonic
+        intraday_deadline_monotonic = overall_deadline_monotonic
+        p0_deadline_monotonic = overall_deadline_monotonic
+
+    def request_timeout_ms(deadline: float | None) -> int | None:
+        return _remaining_request_timeout_ms(
+            deadline,
+            request_timeout_cap_seconds=config.request_timeout_cap_seconds,
+            deadline_guard_seconds=config.deadline_guard_seconds,
+            minimum_request_timeout_seconds=config.minimum_request_timeout_seconds,
+        )
+
+    def exchange_factory(timeout_ms: int) -> Any:
+        try:
+            return type(exchange)({"enableRateLimit": False, "timeout": timeout_ms})
+        except Exception:
+            # Deterministic mocks commonly do not accept a CCXT-style config.
+            # Preserve their existing serial semantics while real CCXT clients
+            # receive the explicit remaining-time timeout above.
+            return exchange
+
+    bootstrap_timeout_ms = request_timeout_ms(daily_deadline_monotonic)
+    if bootstrap_timeout_ms is None:
+        included, excluded, _markets, manifest_errors = [], [], {}, ["MARKETS_DEFERRED_TIME_BUDGET"]
+        source_exchange = exchange
+    else:
+        source_exchange = exchange_factory(bootstrap_timeout_ms)
+        included, excluded, _markets, manifest_errors = _manifest(source_exchange, quote)
     symbols_to_collect = included if config.max_symbols is None else included[:config.max_symbols]
     deferred = included[len(symbols_to_collect):]
     intraday_tf = INTRADAY_TIMEFRAME_BY_EXCHANGE[exchange_id]
-    deadline_monotonic = (time.monotonic() + float(config.time_budget_seconds)) if config.time_budget_seconds is not None else None
-    def exchange_factory():
-        try:
-            return type(exchange)({"enableRateLimit": False, "timeout": 8000})
-        except Exception:
-            # Deterministic mocks commonly do not accept a CCXT-style config;
-            # their tests use one worker and remain serial.
-            return exchange
+
     benchmark_symbol = f"BTC/{quote}"
     # Benchmark is completed-data input and must exist before lazy State3
     # planning; P0 remains strictly after all feature collection.
-    benchmark_daily, benchmark_errors = _fetch_ohlcv(exchange, benchmark_symbol, "1d", config.daily_limit, collected_ms)
+    benchmark_timeout_ms = request_timeout_ms(daily_deadline_monotonic)
+    if benchmark_timeout_ms is None:
+        benchmark_daily, benchmark_errors = [], ["1D_DEFERRED_TIME_BUDGET"]
+    else:
+        benchmark_daily, benchmark_errors = _fetch_ohlcv(
+            exchange_factory(benchmark_timeout_ms), benchmark_symbol, "1d", config.daily_limit, collected_ms
+        )
     target_symbols = [item["symbol"] for item in symbols_to_collect]
     daily_map, daily_deferred = _collect_ohlcv_batched(
-        source_exchange=exchange, exchange_factory=exchange_factory, symbols=target_symbols,
+        source_exchange=source_exchange, exchange_factory=exchange_factory, symbols=target_symbols,
         timeframe="1d", limit=config.daily_limit, collected_at_ms=collected_ms,
-        max_workers=config.max_workers, deadline_monotonic=deadline_monotonic,
+        max_workers=config.max_workers, deadline_monotonic=daily_deadline_monotonic,
+        request_timeout_cap_seconds=config.request_timeout_cap_seconds,
+        deadline_guard_seconds=config.deadline_guard_seconds,
+        minimum_request_timeout_seconds=config.minimum_request_timeout_seconds,
     )
     normalized_symbols: list[dict[str, Any]] = []
     state3_intraday_requested: list[str] = []
@@ -315,9 +393,12 @@ def collect_fc0_completed_data(
             state3_intraday_not_required.append(symbol)
 
     intraday_map, intraday_deferred = _collect_ohlcv_batched(
-        source_exchange=exchange, exchange_factory=exchange_factory, symbols=intraday_needed_symbols,
+        source_exchange=source_exchange, exchange_factory=exchange_factory, symbols=intraday_needed_symbols,
         timeframe=intraday_tf, limit=config.intraday_limit, collected_at_ms=collected_ms,
-        max_workers=config.max_workers, deadline_monotonic=deadline_monotonic,
+        max_workers=config.max_workers, deadline_monotonic=intraday_deadline_monotonic,
+        request_timeout_cap_seconds=config.request_timeout_cap_seconds,
+        deadline_guard_seconds=config.deadline_guard_seconds,
+        minimum_request_timeout_seconds=config.minimum_request_timeout_seconds,
     )
     for symbol in intraday_needed_symbols:
         record = records_by_symbol[symbol]
@@ -342,21 +423,56 @@ def collect_fc0_completed_data(
         if not record["daily"] and "P0_NOT_ATTEMPTED" not in record["collection_error_codes"]:
             record["collection_error_codes"].append("P0_NOT_ATTEMPTED")
             record["live_observation"] = {"p0_status": "not_attempted"}
-    p0_symbols = [record["symbol"] for record in normalized_symbols if record["daily"]]
-    if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
-        tickers, ticker_errors = {}, ["TICKERS_DEFERRED_TIME_BUDGET"]
+    p0_eligible_symbols = [record["symbol"] for record in normalized_symbols if record["daily"]]
+    primary_p0_timeout_ms = request_timeout_ms(p0_deadline_monotonic)
+    ticker_deferred = primary_p0_timeout_ms is None
+    p0_fetch_attempt_count = 0
+    p0_retry_used = False
+    p0_retry_error_codes: list[str] = []
+    if ticker_deferred:
+        tickers, ticker_errors, p0_symbols_attempted = {}, ["TICKERS_DEFERRED_TIME_BUDGET"], []
     else:
-        tickers, ticker_errors = _fetch_tickers_after_features(exchange, p0_symbols)
+        # P0 is deliberately requested through a new public client.  Reusing a
+        # client that has just completed hundreds of OHLCV calls caused the
+        # observed 8-second source-session timeout and late retry.
+        tickers, ticker_errors = _fetch_tickers_after_features(
+            exchange_factory(primary_p0_timeout_ms), p0_eligible_symbols
+        )
+        p0_fetch_attempt_count = 1
+        retry_timeout_ms = request_timeout_ms(p0_deadline_monotonic)
+        if ticker_errors and retry_timeout_ms is not None:
+            p0_retry_used = True
+            retry_tickers, retry_errors = _fetch_tickers_after_features(
+                exchange_factory(retry_timeout_ms), p0_eligible_symbols
+            )
+            p0_fetch_attempt_count = 2
+            p0_retry_error_codes = list(ticker_errors) + list(retry_errors)
+            if retry_tickers:
+                tickers, ticker_errors = retry_tickers, []
+            else:
+                tickers, ticker_errors = retry_tickers, p0_retry_error_codes
+        # The public API method was invoked regardless of whether every symbol
+        # returned a usable ticker; that distinction belongs to p0_status.
+        p0_symbols_attempted = list(p0_eligible_symbols)
     local_now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     p0_observed_ms = max(collected_ms, local_now_ms)
     for record in normalized_symbols:
         if not record["daily"]:
             continue
+        if ticker_deferred:
+            record["live_observation"] = {
+                "observed_at_utc": _iso_utc(p0_observed_ms),
+                "source": "bulk_ticker",
+                "p0_status": "not_attempted",
+            }
+            record["collection_error_codes"].append("P0_NOT_ATTEMPTED_TIME_BUDGET")
+            record["collection_status"]["ticker"] = "not_attempted"
+            continue
         observation, p0_errors, ticker_status = _live_observation_from_ticker(tickers.get(record["symbol"]), p0_observed_ms)
         record["live_observation"] = observation
         record["collection_error_codes"].extend(p0_errors)
         record["collection_status"]["ticker"] = ticker_status
-    time_budget_expired = bool(daily_deferred or intraday_deferred)
+    time_budget_expired = bool(daily_deferred or intraday_deferred or ticker_deferred)
     manifest_hash = sha256("|".join(sorted(item["symbol"] for item in included)).encode("utf-8")).hexdigest()
     return {
         "exchange_id": exchange_id,
@@ -374,11 +490,27 @@ def collect_fc0_completed_data(
             "universe_hash": manifest_hash,
             "intraday_timeframe": intraday_tf,
             "p0_observed_at_utc": _iso_utc(p0_observed_ms),
-            "p0_symbols_attempted": p0_symbols,
+            "p0_symbols_eligible": p0_eligible_symbols,
+            "p0_symbols_attempted": p0_symbols_attempted,
+            "p0_symbols_not_attempted_time_budget": p0_eligible_symbols if ticker_deferred else [],
+            "p0_fetch_attempt_count": p0_fetch_attempt_count,
+            "p0_retry_used": p0_retry_used,
+            "p0_retry_error_codes": p0_retry_error_codes,
             "state3_intraday_requested_symbols": state3_intraday_requested,
             "state3_intraday_not_required_symbols": state3_intraday_not_required,
             "state3_intraday_deferred_symbols": state3_intraday_deferred,
             "time_budget_seconds": config.time_budget_seconds,
+            "time_budget_stage_seconds": {
+                "daily": config.daily_time_budget_seconds,
+                "intraday": config.intraday_time_budget_seconds,
+                "p0": config.p0_time_budget_seconds,
+            },
+            "request_timeout_policy": {
+                "cap_seconds": config.request_timeout_cap_seconds,
+                "deadline_guard_seconds": config.deadline_guard_seconds,
+                "minimum_seconds": config.minimum_request_timeout_seconds,
+                "p0_primary_session": "fresh_public_client",
+            },
             "time_budget_daily_deferred_symbols": daily_deferred,
             "manifest_error_codes": manifest_errors + ticker_errors + benchmark_errors + (["TIME_BUDGET_EXPIRED"] if time_budget_expired else []),
         },
@@ -399,22 +531,49 @@ def _clone_market_state(source: Any, worker: Any) -> Any:
     return worker
 
 
+def _remaining_request_timeout_ms(
+    deadline_monotonic: float | None,
+    *,
+    request_timeout_cap_seconds: float,
+    deadline_guard_seconds: float,
+    minimum_request_timeout_seconds: float,
+) -> int | None:
+    """Return a request timeout that leaves cleanup time before a stage deadline.
+
+    `None` means no new request may start: preserving the hard time boundary is
+    more honest than starting a request that can only finish after the stage.
+    """
+    if deadline_monotonic is None:
+        return int(request_timeout_cap_seconds * 1000)
+    remaining = deadline_monotonic - time.monotonic() - deadline_guard_seconds
+    if remaining < minimum_request_timeout_seconds:
+        return None
+    return max(
+        int(minimum_request_timeout_seconds * 1000),
+        int(min(request_timeout_cap_seconds, remaining) * 1000),
+    )
+
+
 def _collect_ohlcv_batched(
     *,
     source_exchange: Any,
-    exchange_factory: Callable[[], Any] | None,
+    exchange_factory: Callable[[int], Any] | None,
     symbols: list[str],
     timeframe: str,
     limit: int,
     collected_at_ms: int,
     max_workers: int,
     deadline_monotonic: float | None,
+    request_timeout_cap_seconds: float,
+    deadline_guard_seconds: float,
+    minimum_request_timeout_seconds: float,
 ) -> tuple[dict[str, tuple[list[dict[str, Any]], list[str]]], list[str]]:
-    """Bounded batch collection with explicit deferred symbols.
+    """Bounded batch collection with strict request-level stage boundaries.
 
-    At most `max_workers` requests start in a batch.  The time budget is checked
-    between batches so a slow in-flight request can finish cleanly but no new
-    batch starts after expiry.  Deferred rows are never silently dropped.
+    At most `max_workers` requests start in a batch.  Each worker receives a
+    transport timeout no greater than the remaining stage time minus the cleanup
+    guard.  If insufficient time remains, every unstarted symbol is explicitly
+    deferred rather than allowing an 8-second default request to overrun.
     """
     if max_workers < 1:
         raise ValueError("max_workers must be at least 1")
@@ -422,13 +581,19 @@ def _collect_ohlcv_batched(
     deferred: list[str] = []
     cursor = 0
     while cursor < len(symbols):
-        if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+        request_timeout_ms = _remaining_request_timeout_ms(
+            deadline_monotonic,
+            request_timeout_cap_seconds=request_timeout_cap_seconds,
+            deadline_guard_seconds=deadline_guard_seconds,
+            minimum_request_timeout_seconds=minimum_request_timeout_seconds,
+        )
+        if request_timeout_ms is None:
             deferred.extend(symbols[cursor:])
             break
         batch = symbols[cursor: cursor + max_workers]
         cursor += len(batch)
         def task(symbol: str):
-            worker = _clone_market_state(source_exchange, exchange_factory()) if exchange_factory else source_exchange
+            worker = _clone_market_state(source_exchange, exchange_factory(request_timeout_ms)) if exchange_factory else source_exchange
             return symbol, _fetch_ohlcv(worker, symbol, timeframe, limit, collected_at_ms)
         if len(batch) == 1:
             symbol, value = task(batch[0])
