@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 import requests
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import backtest_framework
 
 # ============================================================
@@ -795,6 +796,40 @@ def build_phase1_canonical(exchange, symbol, raw_payload, tf_quality, snapshot_s
     return canonical
 
 
+PHASE1_FACT_LABELS = (
+    "현재가", "구조 상태", "현재 진행 봉", "구조 돌파", "최근 3봉 기하학 및 시퀀스",
+    "단일/연속 캔들 패턴", "다중 스윙 및 채널 패턴", "거래량 배율 및 감속 추세",
+    "가격 공백대", "세력 매물대", "중첩 매물대", "박스 / 수렴 여부",
+    "다이버전스 / 추세 건전성", "RSI 및 모멘텀", "F1~F4 역학 코드",
+)
+
+
+def build_phase1_fact_registry(phase1_result):
+    """이미 표시할 PHASE 1 카드에서 TF별 핵심 사실을 추가 모델 호출 없이 추출한다."""
+    registry = {}
+    text = str(phase1_result or "")
+    section_pattern = r"(?ms)^🔹\s*([^\n]+)\n(.*?)(?=^🔹\s*|\Z)"
+    for section_match in re.finditer(section_pattern, text):
+        tf = section_match.group(1).strip()
+        body = section_match.group(2)
+        for label in PHASE1_FACT_LABELS:
+            fact_match = re.search(rf"(?m)^{re.escape(label)}\s*\n([^\n]+)", body)
+            if not fact_match:
+                continue
+            fact_ref = f"{tf}:{label}"
+            registry[fact_ref] = {"fact_ref": fact_ref, "tf": tf, "label": label, "value": fact_match.group(1).strip()}
+    return registry
+
+
+def validate_phase1_fact_registry(registry):
+    if not isinstance(registry, dict) or not registry:
+        return ["PHASE1 사실 registry 누락"]
+    for fact_ref, item in registry.items():
+        if not isinstance(item, dict) or item.get("fact_ref") != fact_ref or not all(item.get(key) for key in ("tf", "label", "value")):
+            return ["PHASE1 사실 registry 형식 오류"]
+    return []
+
+
 def validate_phase1_canonical(canonical):
     required = {"schema_version", "provenance", "data_quality", "plugins", "observations_payload"}
     if not isinstance(canonical, dict) or set(canonical) != required:
@@ -814,7 +849,7 @@ def validate_phase1_canonical(canonical):
 # - raw payload 전체를 다시 모델에 넣으면 token budget과 계산 계약이 달라지므로, 그 변경은
 #   별도 동등성 검증 전까지 금지한다.
 # ============================================================
-PHASE2_INPUT_PROVENANCE_SCHEMA = "PHASE2_INPUT_PROVENANCE_V1"
+PHASE2_INPUT_PROVENANCE_SCHEMA = "PHASE2_INPUT_PROVENANCE_V2"
 
 
 def build_phase2_input_provenance(phase1_result, phase1_canonical):
@@ -827,6 +862,8 @@ def build_phase2_input_provenance(phase1_result, phase1_canonical):
     for item in tf_quality if isinstance(tf_quality, list) else []:
         if isinstance(item, dict):
             quality_summary.append({"tf": str(item.get("tf", "")), "status": str(item.get("status", ""))})
+    fact_registry = build_phase1_fact_registry(phase1_result)
+    fact_registry_json = json.dumps(fact_registry, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return {
         "schema_version": PHASE2_INPUT_PROVENANCE_SCHEMA,
         "phase1_result_sha256": hashlib.sha256(str(phase1_result or "").encode("utf-8")).hexdigest(),
@@ -836,6 +873,8 @@ def build_phase2_input_provenance(phase1_result, phase1_canonical):
         "exchange": str(provenance.get("exchange", "")),
         "symbol": str(provenance.get("symbol", "")),
         "tf_quality": quality_summary,
+        "fact_registry_sha256": hashlib.sha256(fact_registry_json.encode("utf-8")).hexdigest(),
+        "fact_registry_count": len(fact_registry),
         "model_input_mode": "phase1_result_plus_canonical_provenance_only",
     }
 
@@ -1965,7 +2004,10 @@ def run_phase1(symbol_input, exchange_name, custom_tfs):
             )
         if canonical_warnings:
             phase1_result += "\n\n[자동검증 로그 — Python 사후검증]\n" + "\n".join(f"• {w}" for w in canonical_warnings)
-        # PHASE 1 최종 표시본까지 확정한 뒤 immutable fingerprint를 만든다.
+        # PHASE 1 최종 표시본에서 compact 사실 registry를 만들고 immutable fingerprint를 만든다.
+        # registry는 새 분석이 아니라 이미 표시된 TF별 사실의 참조 목록이며, PHASE 2 Bundle의 출처 검증에만 사용한다.
+        supplement["phase1_fact_registry"] = build_phase1_fact_registry(phase1_result)
+        supplement["phase1_fact_registry_warnings"] = validate_phase1_fact_registry(supplement["phase1_fact_registry"])
         # 이 값은 원천·카드가 이후 바뀌었을 때 PHASE 2 실행을 차단하는 용도이며, 모델 입력을 축약·변형하지 않는다.
         supplement["phase2_input_provenance"] = build_phase2_input_provenance(phase1_result, phase1_canonical)
         return phase1_result, symbol, ex_name.upper(), supplement
@@ -1983,7 +2025,7 @@ def run_phase1(symbol_input, exchange_name, custom_tfs):
 # ============================================================
 LEDGER_START = "[INTERNAL_EVIDENCE_LEDGER]"
 LEDGER_END = "[/INTERNAL_EVIDENCE_LEDGER]"
-LEDGER_FIELDS = ("결론", "등급", "등급보정", "축점수", "순합방향", "가격경로", "지지축", "반대축", "상충축", "중립축", "축내상쇄", "진행국면")
+LEDGER_FIELDS = ("결론", "등급", "등급보정", "축점수", "순합방향", "가격경로", "최종신뢰도점수", "지지축", "반대축", "상충축", "중립축", "축내상쇄", "진행국면")
 
 
 def _load_core_score_cap_from_spec():
@@ -2058,6 +2100,66 @@ def _extract_price_path(value):
     if duplicates:
         warnings.append("가격경로 중복 기록: " + ", ".join(duplicates))
     return prices, warnings
+
+
+def _load_phase2_probability_params_from_spec():
+    """확률 표시식의 상수는 코드에 재정의하지 않고 명세 SSOT에서만 읽는다."""
+    match = re.search(
+        r"Final_신뢰도점수\s*/\s*([0-9]+(?:\.[0-9]+)?).*?Main Path 확률%\s*=\s*([0-9]+)%.*?×\s*([0-9]+)%",
+        CANDLEVIEW_PROMPT_FULL,
+        re.DOTALL,
+    )
+    if not match:
+        return None
+    try:
+        denominator, base_pct, multiplier_pct = (Decimal(value) for value in match.groups())
+    except (InvalidOperation, ValueError):
+        return None
+    if denominator <= 0 or multiplier_pct < 0:
+        return None
+    return {"confidence_denominator": denominator, "base_pct": base_pct, "multiplier_pct": multiplier_pct}
+
+
+PHASE2_PROBABILITY_PARAMS = _load_phase2_probability_params_from_spec()
+
+
+def _parse_decimal(value):
+    try:
+        return Decimal(str(value).replace(",", "").strip())
+    except (InvalidOperation, ValueError, AttributeError):
+        return None
+
+
+def _format_display_number(value):
+    decimal_value = _parse_decimal(value)
+    if decimal_value is None or not decimal_value.is_finite():
+        return None
+    rendered = format(decimal_value.normalize(), "f")
+    return rendered.rstrip("0").rstrip(".") if "." in rendered else rendered
+
+
+def _verified_probability_pair(scores, confidence_value):
+    """명세의 기존 3-C 확률식을 계산하고 표시용 소수점 첫째자리만 결정한다."""
+    params = PHASE2_PROBABILITY_PARAMS
+    confidence = _parse_decimal(confidence_value)
+    if not params or confidence is None or not confidence.is_finite():
+        return None, "확률 검증보류: 신뢰도 점수 또는 확률 SSOT를 읽을 수 없음"
+    if confidence < 0 or confidence > params["confidence_denominator"]:
+        return None, "확률 검증보류: 최종 신뢰도점수가 허용 범위를 벗어남"
+    if LEDGER_SCORE_LIMIT is None:
+        return None, "확률 검증보류: CORE_SCORE_CAP SSOT를 읽을 수 없음"
+    score_total = sum(Decimal(str(value)) for value in scores.values())
+    maximum = Decimal(str(len(scores))) * Decimal(str(LEDGER_SCORE_LIMIT))
+    if maximum <= 0:
+        return None, "확률 검증보류: 축점수 최대범위가 유효하지 않음"
+    evidence_strength = min(Decimal("1"), abs(score_total) / maximum)
+    confidence_ratio = confidence / params["confidence_denominator"]
+    main_raw = params["base_pct"] + (evidence_strength * confidence_ratio * params["multiplier_pct"])
+    if main_raw < Decimal("50") or main_raw > Decimal("90"):
+        return None, "확률 검증보류: 명세 산식 결과가 50~90% 범위를 벗어남"
+    main_display = main_raw.quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
+    alternative_display = Decimal("100.0") - main_display
+    return {"main": main_display, "alternative": alternative_display}, None
 
 
 def _candidate_grade_from_scores(scores):
@@ -2200,13 +2302,13 @@ def verify_and_strip_evidence_ledger(text):
         bundle_lines = [line.strip()[1:].strip() for line in bundle_text.splitlines() if line.strip().startswith("-")]
         for line in bundle_lines:
             parts = [part.strip() for part in line.split("|")]
-            if len(parts) < 6 or not all(parts[:6]):
+            if len(parts) != 7 or not all(parts[:7]):
                 warnings.append(f"Source Bundle 형식 오류: {line}")
                 continue
-            if parts[4] not in ("결정", "국면", "보조", "가격경로"):
+            if parts[5] not in ("결정", "국면", "보조", "가격경로"):
                 warnings.append(f"Source Bundle 1차 역할 오류: {line}")
                 continue
-            bundle_keys.append("|".join(parts[:4]))
+            bundle_keys.append("|".join((parts[0], parts[1], parts[3], parts[4])))
     else:
         warnings.append("근거원장 Bundle 항목 누락")
 
@@ -2428,6 +2530,146 @@ def strip_phase2_validation_log(text):
     return (text or "").split("[자동검증 로그 — Python 사후검증]", 1)[0].rstrip()
 
 
+def build_phase2_display_contract(text):
+    """내부 ledger에서 Telegram 표시 전용 결정값을 만든다. 분석 산식은 수정하지 않는다."""
+    match = re.search(r"\[INTERNAL_EVIDENCE_LEDGER\](.*?)\[/INTERNAL_EVIDENCE_LEDGER\]", text or "", re.DOTALL)
+    if not match:
+        return None, ["결정값 표시 보류: 내부 ledger 없음"]
+    ledger = match.group(1)
+    scores, score_warnings = _extract_signed_axis_scores(_extract_ledger_value(ledger, "축점수"))
+    expected_axes = {"S_1", "S_2", "S_3", "S_4"}
+    if score_warnings or set(scores) != expected_axes or LEDGER_SCORE_LIMIT is None:
+        return None, ["결정값 표시 보류: 축점수 검증 불가"]
+    if not all(np.isfinite(value) and -LEDGER_SCORE_LIMIT <= value <= LEDGER_SCORE_LIMIT for value in scores.values()):
+        return None, ["결정값 표시 보류: 축점수 범위 오류"]
+    direction = _direction_from_net(sum(scores.values()))
+    prices, price_warnings = _extract_price_path(_extract_ledger_value(ledger, "가격경로"))
+    if price_warnings:
+        return None, ["결정값 표시 보류: 가격경로 파싱 오류"]
+    if direction == "횡보":
+        return {"direction": direction, "prices": {}, "probabilities": None}, []
+    if set(prices) != {"P_entry", "P_inv", "P_target_1", "P_target_2"}:
+        return None, ["결정값 표시 보류: 가격경로 필수값 누락"]
+    entry, invalidation = prices["P_entry"], prices["P_inv"]
+    target_1, target_2 = prices["P_target_1"], prices["P_target_2"]
+    ordered = (invalidation < entry < target_1 < target_2) if direction == "상방" else (target_2 < target_1 < entry < invalidation)
+    if not ordered:
+        return None, ["결정값 표시 보류: 가격경로 방향 순서 불일치"]
+    probabilities, probability_warning = _verified_probability_pair(scores, _extract_ledger_value(ledger, "최종신뢰도점수"))
+    warnings = [probability_warning] if probability_warning else []
+    return {"direction": direction, "prices": prices, "probabilities": probabilities}, warnings
+
+
+def _strip_model_phase2_success_tag(text):
+    """성공 태그는 Gemini 문장이 아니라 Python 검증 결과에서만 표시한다."""
+    return re.sub(
+        r"(?im)^\s*(?:(?:<[^>\n]+>|\*\*|__)\s*)?(?:[✅■]\s*)?(?:시스템 무결성 검증 완료|API Direct Data Parsing 완료|Layer 5-B 인라인 검증 100% 통과)(?:\s*(?:</[^>\n]+>|\*\*|__))?\s*$\n?",
+        "",
+        text or "",
+    ).rstrip()
+
+
+MAIN_PATH_SECTION_PATTERN = (
+    r"(?ms)^(?P<header>[^\n]*📈\s*메인 시나리오 파동 경로[^\n]*)\n"
+    r"(?P<body>.*?)(?=^[^\n]*📉\s*대체 시나리오 파동 경로[^\n]*|\Z)"
+)
+ALT_PATH_SECTION_PATTERN = (
+    r"(?ms)^(?P<header>[^\n]*📉\s*대체 시나리오 파동 경로[^\n]*)\n"
+    r"(?P<body>.*?)(?=^[^\n]*(?:⏰️?\s*예상 소요기간|2️⃣)[^\n]*|\Z)"
+)
+
+
+def _is_unverified_decision_value_line(line):
+    """핵심 결정값 키워드와 수치가 함께 있는 행만 제거해 일반 설명 문장은 보존한다."""
+    text = str(line or "")
+    return bool(re.search(r"(확률|현재가|진입|목표|무효화|손절)", text) and re.search(r"\d", text))
+
+
+def _retain_route_context(body):
+    """핵심 결정 수치는 제거하고 FVG·Role Reversal 등 보조 설명은 그대로 유지한다."""
+    lines = [line for line in (body or "").splitlines() if not _is_unverified_decision_value_line(line)]
+    return "\n".join(lines).strip()
+
+
+def _render_path_section(match, card):
+    context = _retain_route_context(match.group("body"))
+    return match.group("header") + "\n" + card + ("\n" + context if context else "") + "\n\n"
+
+
+def _redact_unverified_decision_lines(text):
+    """필수 경로 섹션이 없을 때도 검증되지 않은 핵심 가격·확률 라인을 직접 표시하지 않는다."""
+    lines = [line for line in (text or "").splitlines() if not _is_unverified_decision_value_line(line)]
+    return "\n".join(lines).rstrip()
+
+
+def _strip_nonroute_probability_lines(text, main_match, alt_match):
+    """메인·대체 경로 밖의 확률 줄은 결정값 혼선을 막기 위해 표시하지 않는다."""
+    probability_line = r"(?m)^\s*\(확률[^\n]*\)\s*$\n?"
+    spans = sorted((main_match.span(), alt_match.span()))
+    pieces, cursor, removed = [], 0, False
+    for start, end in spans:
+        outside = text[cursor:start]
+        cleaned = re.sub(probability_line, "", outside)
+        removed = removed or cleaned != outside
+        pieces.append(cleaned)
+        pieces.append(text[start:end])
+        cursor = end
+    outside = text[cursor:]
+    cleaned = re.sub(probability_line, "", outside)
+    removed = removed or cleaned != outside
+    pieces.append(cleaned)
+    return "".join(pieces), removed
+
+
+def render_verified_phase2_decision_blocks(text, contract, quote, all_validation_warnings=None, display_warnings=None):
+    """메인·대체 경로 전체를 단일 출처로 렌더링해 자연어 라벨 변형과 전역 치환을 차단한다."""
+    rendered = _strip_model_phase2_success_tag(text)
+    display_warnings = list(display_warnings or [])
+    main_match = re.search(MAIN_PATH_SECTION_PATTERN, rendered)
+    alt_match = re.search(ALT_PATH_SECTION_PATTERN, rendered)
+    if not (main_match and alt_match):
+        display_warnings.append("결정값 경로 섹션 누락")
+        return _redact_unverified_decision_lines(rendered), display_warnings
+    rendered, nonroute_probability_removed = _strip_nonroute_probability_lines(rendered, main_match, alt_match)
+    if nonroute_probability_removed:
+        display_warnings.append("비경로 확률 표기 제거")
+    main_match = re.search(MAIN_PATH_SECTION_PATTERN, rendered)
+    alt_match = re.search(ALT_PATH_SECTION_PATTERN, rendered)
+
+    probabilities = contract.get("probabilities") if contract else None
+    if contract and contract.get("direction") != "횡보":
+        prices = contract["prices"]
+        entry = _format_display_number(prices["P_entry"])
+        invalidation = _format_display_number(prices["P_inv"])
+        target_1 = _format_display_number(prices["P_target_1"])
+        target_2 = _format_display_number(prices["P_target_2"])
+        main_probability = (
+            f"(확률 {_format_display_number(probabilities['main'])}% — 참고용, 백테스트 검증치 아님)"
+            if probabilities else "(확률 검증보류 — 신뢰도 점수 확인 필요)"
+        )
+        alt_probability = (
+            f"(확률 {_format_display_number(probabilities['alternative'])}% — 참고용, 백테스트 검증치 아님)"
+            if probabilities else "(확률 검증보류 — 신뢰도 점수 확인 필요)"
+        )
+        main_card = (
+            f"{main_probability}\n"
+            f"➔ 검증된 진입 예상가 ({entry} {quote})\n"
+            f"➔ 검증된 1차 목표가 ({target_1} {quote})\n"
+            f"➔ 검증된 2차 목표가 ({target_2} {quote})"
+        )
+        alt_card = f"{alt_probability}\n➔ 검증된 무효화선 ({invalidation} {quote}) 이탈"
+    else:
+        display_warnings.append("결정값 표시 보류")
+        main_card = "(결정값 검증보류 — 가격경로 확인 필요)"
+        alt_card = "(결정값 검증보류 — 가격경로 확인 필요)"
+
+    rendered = re.sub(MAIN_PATH_SECTION_PATTERN, lambda match: _render_path_section(match, main_card), rendered, count=1)
+    rendered = re.sub(ALT_PATH_SECTION_PATTERN, lambda match: _render_path_section(match, alt_card), rendered, count=1)
+    if not all_validation_warnings and not display_warnings:
+        rendered = rendered.rstrip() + "\n\n시스템 무결성 검증 완료\n■ API Direct Data Parsing 완료\n■ Layer 5-B 인라인 검증 100% 통과"
+    return rendered.rstrip(), display_warnings
+
+
 def try_deterministic_phase2_repair(text, warnings):
     """모델의 중복 ledger 파생 필드만 기존 Python 수식으로 맞춘다. 점수·가격·원천은 수정하지 않는다."""
     allowed_prefixes = (
@@ -2494,7 +2736,7 @@ PHASE2_RESPONSE_SCHEMA = {
         "user_briefing": {"type": "string", "description": "사용자에게 표시할 기존 PHASE 2 자연어 브리핑 전체. 1️⃣~6️⃣의 기존 순서·맥락 흐름·조건부 반대근거 서술을 충분히 포함한다. 내부 원장 블록은 포함하지 않는다."},
         "ledger": {
             "type": "object", "additionalProperties": False,
-            "required": ["conclusion", "grade", "grade_adjustment", "axis_scores", "net_direction", "price_path", "support_axes", "opposition_axes", "contested_axes", "neutral_axes", "nested_offset", "regime", "bundles"],
+            "required": ["conclusion", "grade", "grade_adjustment", "axis_scores", "net_direction", "price_path", "final_confidence_score", "support_axes", "opposition_axes", "contested_axes", "neutral_axes", "nested_offset", "regime", "bundles"],
             "properties": {
                 "conclusion": {"type": "string", "enum": ["상방", "하방", "횡보"]},
                 "grade": {"type": "string", "enum": ["강", "보통", "약함", "횡보"]},
@@ -2502,6 +2744,7 @@ PHASE2_RESPONSE_SCHEMA = {
                 "axis_scores": {"type": "object", "additionalProperties": False, "required": ["S_1", "S_2", "S_3", "S_4"], "properties": {"S_1": {"type": "number"}, "S_2": {"type": "number"}, "S_3": {"type": "number"}, "S_4": {"type": "number"}}},
                 "net_direction": {"type": "string", "enum": ["상방", "하방", "횡보"]},
                 "price_path": {"type": "string"},
+                "final_confidence_score": {"type": "number", "minimum": 0, "maximum": 5.9},
                 "support_axes": {"type": "array", "items": {"type": "string", "enum": ["S_1", "S_2", "S_3", "S_4"]}},
                 "opposition_axes": {"type": "array", "items": {"type": "string", "enum": ["S_1", "S_2", "S_3", "S_4"]}},
                 "contested_axes": {"type": "array", "items": {"type": "string", "enum": ["S_1", "S_2", "S_3", "S_4"]}},
@@ -2511,11 +2754,12 @@ PHASE2_RESPONSE_SCHEMA = {
                     "type": "array", "minItems": 1,
                     "items": {
                         "type": "object", "additionalProperties": False,
-                        "required": ["tf", "window", "fact", "direction", "role", "axis"],
+                        "required": ["tf", "window", "fact", "fact_ref", "direction", "role", "axis"],
                         "properties": {
                             "tf": {"type": "string", "minLength": 1},
                             "window": {"type": "string", "minLength": 1},
                             "fact": {"type": "string", "minLength": 1},
+                            "fact_ref": {"type": "string", "minLength": 1},
                             "direction": {"type": "string", "enum": ["상방", "하방", "중립"]},
                             "role": {"type": "string", "enum": ["결정", "국면", "보조", "가격경로"]},
                             "axis": {"type": "string", "enum": ["S_1", "S_2", "S_3", "S_4"]},
@@ -2532,8 +2776,8 @@ def _load_phase2_response_schema():
     return PHASE2_RESPONSE_SCHEMA
 
 
-def render_phase2_structured_response(raw_json):
-    """JSON의 user_briefing은 그대로 보존하고 ledger만 기존 검증용 내부 블록으로 변환한다."""
+def render_phase2_structured_response(raw_json, phase1_fact_registry=None):
+    """JSON의 user_briefing은 보존하고 Bundle 사실은 PHASE 1 registry 값으로만 ledger에 기록한다."""
     try:
         response = json.loads(raw_json)
         briefing = response["user_briefing"]
@@ -2551,6 +2795,7 @@ def render_phase2_structured_response(raw_json):
             f"등급보정: {ledger['grade_adjustment']}",
             "축점수: " + ", ".join(f"{key}={scores[key]}" for key in required_scores),
             f"순합방향: {ledger['net_direction']}", f"가격경로: {ledger['price_path']}",
+            f"최종신뢰도점수: {ledger['final_confidence_score']}",
             "지지축: " + axis_text(ledger["support_axes"]),
             "반대축: " + axis_text(ledger["opposition_axes"]),
             "상충축: " + axis_text(ledger["contested_axes"]),
@@ -2561,8 +2806,12 @@ def render_phase2_structured_response(raw_json):
         for bundle in ledger["bundles"]:
             if not isinstance(bundle, dict):
                 raise ValueError("Source Bundle 객체 형식 오류")
+            fact_ref = str(bundle["fact_ref"])
+            source_fact = (phase1_fact_registry or {}).get(fact_ref)
+            if not isinstance(source_fact, dict) or source_fact.get("tf") != str(bundle["tf"]):
+                raise ValueError(f"Source Bundle PHASE1 사실 참조 오류: {fact_ref}")
             lines.append("- " + "|".join([
-                str(bundle["tf"]), str(bundle["window"]), str(bundle["fact"]),
+                str(bundle["tf"]), str(bundle["window"]), str(source_fact["value"]), fact_ref,
                 str(bundle["direction"]), str(bundle["role"]), str(bundle["axis"]),
             ]))
         lines.append(LEDGER_END)
@@ -2619,15 +2868,24 @@ def run_phase2(phase1_result, symbol, exchange_name, phase1_canonical=None, phas
         observe("PRECHECK_HELD", rule_ids=rule_ids)
         return "[검증보류 — PHASE 2 실행 차단]\n" + "\n".join(f"• {w}" for w in precheck_warnings)
 
+    phase1_fact_registry = build_phase1_fact_registry(phase1_result)
+    fact_registry_warnings = validate_phase1_fact_registry(phase1_fact_registry)
+    fact_refs_for_prompt = sorted(phase1_fact_registry)
+
     base_prompt = (
         f"{CANDLEVIEW_PROMPT_FULL}\n\n"
         f"아래는 이미 완성된 PHASE 1 결과입니다. 사용자는 PHASE 2 진행을 명시적으로 승인하였습니다.\n\n"
         f"[PHASE 1 canonical provenance]\n{json.dumps(phase1_canonical['provenance'], ensure_ascii=False, sort_keys=True)}\n\n"
         f"[PHASE 1 완성 결과]\n{phase1_result}\n\n"
+        f"[PHASE 1 사실 참조 목록]\n{json.dumps(fact_refs_for_prompt, ensure_ascii=False)}\n\n"
         f"이제 PHASE 2 통합 브리핑을 엔진 규칙에 따라 완제 출력하십시오. 새로운 수치나 판단을 임의로 추가하지 말고, PHASE 1에서 도출된 데이터만을 근거로 사용하십시오.\n"
         f"반드시 JSON으로 응답하십시오. user_briefing에는 기존 1️⃣~6️⃣ 자연어 브리핑 전체를 충분한 문맥으로 작성하고, INTERNAL_EVIDENCE_LEDGER 표식은 넣지 마십시오. "
-        f"ledger에는 같은 결론의 검증용 원장만 작성하십시오. ledger.bundles의 각 항목은 문자열이 아니라 "
-        f"tf·window·fact·direction·role·axis 여섯 필드를 모두 가진 JSON 객체여야 합니다. "
+        f"다만 1️⃣의 메인·대체 시나리오 경로에서는 가격·확률 숫자를 직접 쓰지 말고, 각 라벨과 보조 레벨(FVG·Role Reversal·돌파선·다음 매물대)만 작성하십시오. "
+        f"Python이 검증 완료된 ledger 값으로 진입·무효화·목표가·확률을 표시합니다. "
+        f"'시스템 무결성 검증 완료', 'API Direct Data Parsing 완료', 'Layer 5-B 인라인 검증 100% 통과' 태그는 절대 작성하지 마십시오. "
+        f"ledger에는 같은 결론의 검증용 원장과 기존 Final_신뢰도점수(0~5.9)를 final_confidence_score로 작성하십시오. ledger.bundles의 각 항목은 문자열이 아니라 "
+        f"tf·window·fact·fact_ref·direction·role·axis 일곱 필드를 모두 가진 JSON 객체여야 합니다. "
+        f"fact_ref는 반드시 위 PHASE 1 사실 참조 목록의 값 하나를 사용하고 tf와 일치해야 합니다. fact는 해당 참조의 설명용 복사본입니다. "
         f"direction은 상방·하방·중립, role은 결정·국면·보조·가격경로, axis는 S_1~S_4 중 하나만 사용하십시오."
     )
     lightweight_repair_prompt = None
@@ -2666,16 +2924,23 @@ def run_phase2(phase1_result, symbol, exchange_name, phase1_canonical=None, phas
                 prompt_tokens=response_meta.get("prompt_token_count", 0),
                 output_tokens=response_meta.get("output_token_count", 0),
                 total_tokens=response_meta.get("total_token_count", 0))
-        raw_result, structured_warnings = render_phase2_structured_response(raw_json)
+        raw_result, structured_warnings = render_phase2_structured_response(raw_json, phase1_fact_registry)
         if structured_warnings:
             fallback_briefing = extract_phase2_briefing_fallback(raw_json)
             if fallback_briefing:
+                fallback_display, fallback_display_warnings = render_verified_phase2_decision_blocks(
+                    fallback_briefing,
+                    None,
+                    symbol.rsplit("/", 1)[-1] if "/" in symbol else "",
+                    all_validation_warnings=structured_warnings,
+                    display_warnings=["구조화 ledger 검증보류"],
+                )
                 observe(
                     "STRUCTURED_LEDGER_OBSERVED", attempt=attempt + 1, rule_ids=["P2S01"],
-                    observation_codes=["LEDGER_ABSENT"],
+                    observation_codes=["LEDGER_ABSENT"] + sorted(set(fallback_display_warnings)),
                 )
                 observe("PUBLISHED", attempt=attempt + 1)
-                return fallback_briefing
+                return fallback_display
             # user_briefing 자체가 없을 때만 한 번의 경량 repair를 허용한다.
             last_rule_ids = classify_phase2_verification_warnings(structured_warnings, structured=True)
             observe("STRUCTURED_BRIEFING_HELD", attempt=attempt + 1, rule_ids=last_rule_ids, rule_subcodes=["P2S01"])
@@ -2702,10 +2967,24 @@ def run_phase2(phase1_result, symbol, exchange_name, phase1_canonical=None, phas
         elif normalization_meta.get("observation_codes"):
             observe(
                 "LEDGER_OBSERVED", attempt=attempt + 1, rule_ids=["P2V01"],
-                observation_codes=normalization_meta["observation_codes"],
+                observation_codes=normalization_meta["observation_codes"] + fact_registry_warnings,
+            )
+        clean_briefing = strip_phase2_validation_log(last_verified)
+        display_contract, display_warnings = build_phase2_display_contract(normalized_result)
+        published_briefing, display_warnings = render_verified_phase2_decision_blocks(
+            clean_briefing,
+            display_contract,
+            symbol.rsplit("/", 1)[-1] if "/" in symbol else "",
+            all_validation_warnings=validation_warnings,
+            display_warnings=display_warnings,
+        )
+        if display_warnings:
+            observe(
+                "DISPLAY_CONTRACT_OBSERVED", attempt=attempt + 1, rule_ids=["P2D01"],
+                observation_codes=sorted(set(display_warnings)),
             )
         observe("PUBLISHED", attempt=attempt + 1)
-        return strip_phase2_validation_log(last_verified)
+        return published_briefing
     observe("RETRY_EXHAUSTED", rule_ids=last_rule_ids)
     return (
         "[검증보류 — 최대 2회 재질의 후 무결성 미통과]\n"
