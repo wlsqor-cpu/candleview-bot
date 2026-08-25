@@ -2832,19 +2832,24 @@ def try_deterministic_phase2_repair(text, warnings):
     return repaired, metadata
 
 
-def build_phase2_lightweight_repair_prompt(provisional_json, warnings, phase1_fact_refs=None):
-    """원천·전체 명세를 재주입하지 않고 기존 자연어와 ledger 계약만 복구하는 제한 prompt를 만든다."""
+def build_phase2_lightweight_repair_prompt(provisional_json, warnings, phase1_fact_refs=None,
+                                               phase1_result="", phase1_canonical=None):
+    """같은 PHASE 1 근거로 기존 자연어를 보존한 채 누락 ledger만 복구하는 제한 prompt를 만든다."""
     safe_warnings = "\n".join(f"- {str(warning)[:240]}" for warning in (warnings or [])[:12])
     safe_fact_refs = json.dumps(sorted(str(item) for item in (phase1_fact_refs or [])), ensure_ascii=False)
+    safe_phase1 = str(phase1_result or "").strip()
+    safe_canonical = json.dumps((phase1_canonical or {}).get("provenance", {}), ensure_ascii=False, sort_keys=True)
     return (
         "[PHASE 2 경량 검증 repair]\n"
-        "아래 provisional JSON만 수정하십시오. 새 수치·새 원천 사실·새 시나리오를 추가하지 마십시오. "
-        "user_briefing이 이미 있으면 그 문자열은 한 글자도 바꾸지 말고 그대로 유지하십시오. "
-        "ledger가 없거나 불완전하면 기존 판단과 같은 결론의 완전한 ledger 객체만 추가·보완하십시오. "
-        "가격경로·점수·확률 입력은 provisional JSON의 기존 판단에서만 가져오며, 허용된 fact_ref 목록 밖의 참조는 쓰지 마십시오. "
+        "아래 provisional JSON의 user_briefing은 한 글자도 바꾸지 마십시오. 새 원천 수집·새 시장 사실·새 시나리오는 금지합니다. "
+        "다만 아래에 다시 제공한 동일 PHASE 1 데이터와 canonical provenance에서 이미 도출 가능한 값으로, 누락되거나 불완전한 ledger를 완전한 객체로 작성하십시오. "
+        "가격경로·축점수·신뢰도·Bundle은 PHASE 1 근거에만 결속하고, 허용 fact_ref 목록 밖의 참조는 쓰지 마십시오. "
+        "ledger는 response JSON schema의 모든 필수 필드와 최소 한 개 Bundle을 포함해야 합니다. "
         "동일 response JSON schema의 완전한 JSON 하나만 반환하십시오.\n\n"
         "[검증오류]\n" + safe_warnings + "\n\n"
+        "[PHASE 1 canonical provenance]\n" + safe_canonical + "\n\n"
         "[허용 PHASE 1 fact_ref]\n" + safe_fact_refs + "\n\n"
+        "[PHASE 1 완성 결과]\n" + safe_phase1 + "\n\n"
         "[provisional JSON]\n" + str(provisional_json)
     )
 
@@ -3077,7 +3082,8 @@ def run_phase2(phase1_result, symbol, exchange_name, phase1_canonical=None, phas
                 )
                 provisional_fallback_briefing = extract_phase2_briefing_fallback(raw_json)
                 lightweight_repair_prompt = build_phase2_lightweight_repair_prompt(
-                    raw_json, structured_warnings, fact_refs_for_prompt
+                    raw_json, structured_warnings, fact_refs_for_prompt,
+                    phase1_result=phase1_result, phase1_canonical=phase1_canonical,
                 )
                 continue
             # 경량 repair까지 실패했을 때만 자연어를 보존하는 기존 fallback을 사용한다.
