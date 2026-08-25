@@ -231,6 +231,46 @@ if not CANDLEVIEW_PROMPT_FULL:
     CANDLEVIEW_PROMPT_FULL = "CandleView 정밀 연산 엔진"
     print("[WARN] 엔진 파일을 찾지 못해 기본 문자열로 대체합니다.")
 
+
+def build_phase_runtime_prompts(full_prompt):
+    """PHASE 1 데이터 카드와 PHASE 2 분석이 각자 필요한 엔진 절만 사용하게 분리한다.
+
+    PHASE 1은 API 수집·품질·STAGE 0 카드 절만, PHASE 2는 프랙탈·Layer 3~5 분석 절만 받는다.
+    결함 이력과 FindCoin 전용 장은 특정 코인 일반 분석의 어느 phase에도 재주입하지 않는다.
+    사양 표식이 누락·재정렬된 경우 전체 사양을 두 phase에 그대로 반환해 규칙 유실을 막는다.
+    """
+    if not isinstance(full_prompt, str) or not full_prompt.strip():
+        return full_prompt, full_prompt
+    markers = {
+        "history": "📋 [결함 판정 이력 대장]",
+        "runtime": "(PA-VSA 전용 API 데이터 정밀 연산 엔진",
+        "fractal": "▶ Layer 0. 프랙탈 컨테이너 매트릭스",
+        "layer1": "=== 2. [Layer 1] 전역 표준 상수",
+        "stage0": "=== 7. [Layer 2] STAGE 0",
+        "layer3": "=== 8. [Layer 3] 해석 엔진",
+        "findcoin": "=== 14. FindCoin 플러그인 모듈",
+    }
+    positions = {name: full_prompt.find(marker) for name, marker in markers.items()}
+    ordered = [positions[name] for name in ("history", "runtime", "fractal", "layer1", "stage0", "layer3", "findcoin")]
+    if not (all(position >= 0 for position in ordered) and ordered == sorted(ordered)):
+        print("[WARN] PHASE별 prompt 경계를 확인하지 못해 전체 엔진 사양을 유지합니다.")
+        return full_prompt, full_prompt
+    preamble = full_prompt[:positions["history"]].strip()
+    phase_rules = full_prompt[positions["runtime"]:positions["fractal"]].strip()
+    stage0_rules = full_prompt[positions["layer1"]:positions["layer3"]].strip()
+    analysis_prerequisites = full_prompt[positions["fractal"]:positions["stage0"]].strip()
+    analysis_rules = full_prompt[positions["layer3"]:positions["findcoin"]].strip()
+    phase1_prompt = "\n\n".join((preamble, phase_rules, stage0_rules))
+    phase2_prompt = "\n\n".join((preamble, phase_rules, analysis_prerequisites, analysis_rules))
+    print(
+        f"[INFO] PHASE별 runtime profile: P1 {len(phase1_prompt):,}자 / "
+        f"P2 {len(phase2_prompt):,}자 / 전체 {len(full_prompt):,}자"
+    )
+    return phase1_prompt, phase2_prompt
+
+
+CANDLEVIEW_PROMPT_PHASE1, CANDLEVIEW_PROMPT_PHASE2 = build_phase_runtime_prompts(CANDLEVIEW_PROMPT_FULL)
+
 # ============================================================
 # 분석 세션 임시 저장소
 # - 인라인 callback_data에는 사용자 입력·심볼·TF를 넣지 않는다. Telegram의 UTF-8 64바이트
@@ -1489,13 +1529,18 @@ def _friendly_model_name(model_id):
 
 
 def format_model_provenance(metadata, python_only=False):
-    """사용자 출력에는 안전한 표시용 모델명·선택 상태만 노출한다."""
+    """사용자 출력에는 실제 실패 유형을 숨기지 않는 안전한 표시용 모델 상태만 노출한다."""
     if python_only:
         return "분석 모델: 미사용 (Python 사전계산)"
     metadata = metadata or {}
     if metadata.get("failed"):
         kind = metadata.get("failure_kind", "model_call")
-        label = "선택 실패" if kind == "model_selection" else "연결 실패"
+        label = {
+            "model_selection": "선택 실패",
+            "quota_exhausted": "할당량 제한",
+            "service_unavailable": "일시 과부하",
+            "network_exception": "연결 실패",
+        }.get(kind, "응답 실패")
         return f"분석 모델: {label}"
     model_id = metadata.get("model_id") or _model_id_from_url(metadata.get("model_url", ""))
     suffix = "자동 fallback" if metadata.get("fallback_used") else metadata.get("selection_source", "고정 승인 모델")
@@ -1505,10 +1550,17 @@ def format_model_provenance(metadata, python_only=False):
 
 def model_execution_hold_message(metadata):
     metadata = metadata or {}
-    if metadata.get("failure_kind") == "model_selection":
+    kind = metadata.get("failure_kind")
+    if kind == "model_selection":
         return ("⚠️ <b>분석 실행 보류</b>\n"
                 "현재 고정 승인 Gemini 모델 목록을 사용할 수 없습니다.\n"
                 "분석 결과는 생성되지 않았습니다. 잠시 후 동일 명령으로 다시 실행해 주세요.")
+    if kind == "quota_exhausted":
+        wait = metadata.get("retry_after_seconds")
+        wait_hint = f" 약 {wait}초 후" if wait else " 잠시 후"
+        return ("⚠️ <b>분석 실행 보류 — Gemini 할당량 제한</b>\n"
+                f"승인된 분석 모델의 현재 할당량이 부족합니다.{wait_hint} 같은 명령으로 다시 시도해 주세요.\n"
+                "원천 수집 데이터는 유지되지만 AI 해석·가격 경로·확률은 생성되지 않았습니다.")
     return ("⚠️ <b>분석 실행 실패</b>\n"
             "현재 분석 모델에 연결할 수 없어 결과를 생성하지 않았습니다.\n"
             "시장 분석·가격 경로·투자 판단은 발행되지 않았습니다. 잠시 후 다시 실행해 주세요.")
@@ -1558,7 +1610,8 @@ def _bounded_retry_delay_seconds(attempt_index, retry_after_seconds=None, jitter
 
 
 def call_gemini_api_with_retry(full_prompt, max_tokens=16384, preferred_url=None, return_metadata=False,
-                               response_json_schema=None, allow_preferred_fallback=False):
+                               response_json_schema=None, allow_preferred_fallback=False,
+                               allow_short_quota_retry=False):
     headers = {
         "Content-Type": "application/json",
         "X-goog-api-key": GEMINI_API_KEY,
@@ -1601,6 +1654,7 @@ def call_gemini_api_with_retry(full_prompt, max_tokens=16384, preferred_url=None
     last_failure_kind = "model_call"
     last_retry_after_seconds = None
     last_model_url = ""
+    short_quota_retry_consumed = False
     for candidate_index, candidate in enumerate(candidates):
         url = candidate["model_url"]
         last_model_url = url
@@ -1616,10 +1670,9 @@ def call_gemini_api_with_retry(full_prompt, max_tokens=16384, preferred_url=None
                         p.get("text", "") for p in parts if p.get("text") and not p.get("thought")
                     )
                     if answer_text:
-                        # [판정51번 — 유료기능(명시적캐싱) 배제, 관측용 로그만 추가] Gemini
-                        # 2.5+ 계열은 암묵적 캐싱이 기본 무료 활성화돼 있고 CANDLEVIEW_PROMPT_FULL이
-                        # 매 호출 동일 프리픽스로 들어가 조건을 충족하므로, 실제 히트여부만 로그로
-                        # 확인한다 — 신규 API호출·과금·코드경로 분기 없음, .get() 전부 안전폴백.
+                        # [호출량 관측] Gemini 2.5+ 계열은 암묵적 캐싱이 기본 활성화된다.
+                        # 일반 분석은 PHASE별 runtime profile이 각 phase 안에서 동일 prefix로 들어가므로,
+                        # 비용·quota 보장은 하지 않고 실제 cache hit만 관측한다. 신규 호출·과금·분기는 없다.
                         usage = data.get("usageMetadata", {})
                         cached_tok = usage.get("cachedContentTokenCount", 0)
                         prompt_tok = usage.get("promptTokenCount", 0)
@@ -1643,10 +1696,20 @@ def call_gemini_api_with_retry(full_prompt, max_tokens=16384, preferred_url=None
                     print(f"[WARN] Gemini 응답에 최종 답변 파트 없음(사고과정만 수신, parts={len(parts)}개), 재시도")
                     time.sleep(_bounded_retry_delay_seconds(transport_attempt))
                 elif res.status_code == 429:
-                    # 일·분 단위 할당량은 즉시 같은 요청을 재시도해도 회복되지 않을 수 있다.
-                    # 명시적으로 허용된 PHASE 2 경로만 뒤 순위 승인 모델로 같은 입력을 대체 호출할 수 있다.
+                    # provider가 짧고 명시적인 RetryInfo를 준 PHASE 1 요청에 한해, 전체 roster에서 한 번만 같은 입력을 기다려 재시도한다.
+                    # RetryInfo가 없거나 장기 대기면 즉시 승인된 다음 후보로 넘어가 불필요한 대형 호출·대기를 만들지 않는다.
                     last_failure_kind = "quota_exhausted"
                     last_retry_after_seconds = _response_retry_after_seconds(res)
+                    if (
+                        allow_short_quota_retry
+                        and not short_quota_retry_consumed
+                        and last_retry_after_seconds is not None
+                        and 0 < last_retry_after_seconds <= 15
+                    ):
+                        short_quota_retry_consumed = True
+                        print(f"[WARN] Gemini 할당량 제한(429): provider RetryInfo {last_retry_after_seconds}초 후 동일 요청을 한 번 재시도합니다")
+                        time.sleep(last_retry_after_seconds)
+                        continue
                     print("[WARN] Gemini 할당량 제한(429): 승인 roster의 허용된 다음 후보를 확인합니다")
                     break
                 elif res.status_code == 503:
@@ -2015,7 +2078,7 @@ def run_phase1(symbol_input, exchange_name, custom_tfs):
         payload += format_plugin_payload(oi_info, wall_info)
 
         phase1_prompt = (
-            f"{CANDLEVIEW_PROMPT_FULL}\n\n"
+            f"{CANDLEVIEW_PROMPT_PHASE1}\n\n"
             f"[API 수신 원천 데이터]\n{payload}\n\n"
             f"[STAGE 0 품질 게이트 실행 지시]\n"
             f"각 TF의 '원천 데이터 품질 감사' 상태가 데이터결손/판정불가이면, PHASE 1의 해당 카드 항목을 생략하지 말고 "
@@ -2033,7 +2096,8 @@ def run_phase1(symbol_input, exchange_name, custom_tfs):
         )
         canonical_warnings = validate_phase1_canonical(phase1_canonical)
         phase1_result, phase1_model_meta = call_gemini_api_with_retry(
-            phase1_prompt, max_tokens=12000, return_metadata=True
+            phase1_prompt, max_tokens=12000, return_metadata=True,
+            allow_short_quota_retry=True,
         )
         supplement = {
             "delta_list": tf_delta_list,
@@ -2048,9 +2112,16 @@ def run_phase1(symbol_input, exchange_name, custom_tfs):
         }
         if phase1_model_meta.get("failed"):
             # 수집데이터·보간지표는 Gemini 실패와 독립적으로 열람 가능해야 한다.
+            failure_kind = phase1_model_meta.get("failure_kind")
+            if failure_kind == "quota_exhausted":
+                retry_after_seconds = phase1_model_meta.get("retry_after_seconds")
+                retry_hint = f" 약 {retry_after_seconds}초 후" if retry_after_seconds else " 잠시 후"
+                failure_line = f"승인된 Gemini 모델의 현재 할당량이 부족합니다.{retry_hint} 같은 명령으로 다시 시도해 주세요."
+            else:
+                failure_line = "모델 연결 또는 응답 실패로 PHASE 1 표 해석은 생성하지 않았습니다."
             phase1_result = (
                 "[PHASE 1 AI 해석 보류 — Python 원천 수집은 완료]\n"
-                "모델 연결 실패로 PHASE 1 표 해석은 생성하지 않았습니다.\n"
+                + failure_line + "\n"
                 "아래는 분석 추정 없이 Python이 수집·가공한 STAGE 0 원천 데이터입니다.\n\n"
                 + payload
             )
@@ -2931,7 +3002,7 @@ def run_phase2(phase1_result, symbol, exchange_name, phase1_canonical=None, phas
     fact_refs_for_prompt = sorted(phase1_fact_registry)
 
     base_prompt = (
-        f"{CANDLEVIEW_PROMPT_FULL}\n\n"
+        f"{CANDLEVIEW_PROMPT_PHASE2}\n\n"
         f"아래는 이미 완성된 PHASE 1 결과입니다. 사용자는 PHASE 2 진행을 명시적으로 승인하였습니다.\n\n"
         f"[PHASE 1 canonical provenance]\n{json.dumps(phase1_canonical['provenance'], ensure_ascii=False, sort_keys=True)}\n\n"
         f"[PHASE 1 완성 결과]\n{phase1_result}\n\n"
