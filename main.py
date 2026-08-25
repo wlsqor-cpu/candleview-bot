@@ -2834,23 +2834,27 @@ def try_deterministic_phase2_repair(text, warnings):
 
 def build_phase2_lightweight_repair_prompt(provisional_json, warnings, phase1_fact_refs=None,
                                                phase1_result="", phase1_canonical=None):
-    """같은 PHASE 1 근거로 기존 자연어를 보존한 채 누락 ledger만 복구하는 제한 prompt를 만든다."""
+    """기존 자연어를 Python이 보존하고, 모델은 ledger 객체만 제한적으로 복구하게 한다."""
     safe_warnings = "\n".join(f"- {str(warning)[:240]}" for warning in (warnings or [])[:12])
     safe_fact_refs = json.dumps(sorted(str(item) for item in (phase1_fact_refs or [])), ensure_ascii=False)
     safe_phase1 = str(phase1_result or "").strip()
     safe_canonical = json.dumps((phase1_canonical or {}).get("provenance", {}), ensure_ascii=False, sort_keys=True)
+    try:
+        provisional_briefing = extract_phase2_briefing_fallback(provisional_json)
+    except Exception:
+        provisional_briefing = ""
     return (
-        "[PHASE 2 경량 검증 repair]\n"
-        "아래 provisional JSON의 user_briefing은 한 글자도 바꾸지 마십시오. 새 원천 수집·새 시장 사실·새 시나리오는 금지합니다. "
-        "다만 아래에 다시 제공한 동일 PHASE 1 데이터와 canonical provenance에서 이미 도출 가능한 값으로, 누락되거나 불완전한 ledger를 완전한 객체로 작성하십시오. "
+        "[PHASE 2 ledger 전용 검증 repair]\n"
+        "아래 provisional user_briefing은 Python이 그대로 보존·발행하므로 절대로 재작성하거나 출력하지 마십시오. "
+        "새 원천 수집·새 시장 사실·새 시나리오는 금지합니다. 동일 PHASE 1 데이터와 canonical provenance에서 이미 도출 가능한 값만 사용해 ledger를 완성하십시오. "
         "가격경로·축점수·신뢰도·Bundle은 PHASE 1 근거에만 결속하고, 허용 fact_ref 목록 밖의 참조는 쓰지 마십시오. "
-        "ledger는 response JSON schema의 모든 필수 필드와 최소 한 개 Bundle을 포함해야 합니다. "
-        "동일 response JSON schema의 완전한 JSON 하나만 반환하십시오.\n\n"
+        "응답은 반드시 ledger-repair JSON schema에 맞는 {\"ledger\": {...}} 하나여야 하며, user_briefing·설명문·마크다운은 절대 포함하지 마십시오. "
+        "ledger는 모든 필수 필드와 최소 한 개 Bundle을 포함해야 합니다.\n\n"
         "[검증오류]\n" + safe_warnings + "\n\n"
+        "[보존할 provisional user_briefing — 출력 금지]\n" + provisional_briefing + "\n\n"
         "[PHASE 1 canonical provenance]\n" + safe_canonical + "\n\n"
         "[허용 PHASE 1 fact_ref]\n" + safe_fact_refs + "\n\n"
-        "[PHASE 1 완성 결과]\n" + safe_phase1 + "\n\n"
-        "[provisional JSON]\n" + str(provisional_json)
+        "[PHASE 1 완성 결과]\n" + safe_phase1
     )
 
 
@@ -2898,8 +2902,20 @@ PHASE2_RESPONSE_SCHEMA = {
 }
 
 
+PHASE2_LEDGER_REPAIR_SCHEMA = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object", "additionalProperties": False,
+    "required": ["ledger"],
+    "properties": {"ledger": PHASE2_RESPONSE_SCHEMA["properties"]["ledger"]},
+}
+
+
 def _load_phase2_response_schema():
     return PHASE2_RESPONSE_SCHEMA
+
+
+def _load_phase2_ledger_repair_schema():
+    return PHASE2_LEDGER_REPAIR_SCHEMA
 
 
 def render_phase2_structured_response(raw_json, phase1_fact_registry=None):
@@ -2944,6 +2960,40 @@ def render_phase2_structured_response(raw_json, phase1_fact_registry=None):
         return briefing.strip() + "\n\n" + "\n".join(lines), []
     except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
         return "", [f"PHASE2 구조화 JSON 파싱 실패: {exc}"]
+
+
+def render_phase2_ledger_repair_response(raw_json, preserved_briefing, phase1_fact_registry=None):
+    """ledger 전용 repair 응답을 최초 자연어와 결합해 동일 renderer 계약으로 검증한다."""
+    try:
+        response = json.loads(raw_json)
+        if not isinstance(response, dict):
+            raise ValueError("ledger 객체 누락")
+        # schema 준수 wrapper를 우선하고, provider가 wrapper만 생략한 순수 ledger 객체도 같은 검증으로 수용한다.
+        ledger = response.get("ledger", response)
+        if not isinstance(ledger, dict) or "axis_scores" not in ledger:
+            raise ValueError("ledger 객체 누락")
+        combined = json.dumps({"user_briefing": str(preserved_briefing or ""), "ledger": ledger}, ensure_ascii=False)
+        return render_phase2_structured_response(combined, phase1_fact_registry)
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+        return "", [f"PHASE2 ledger 전용 repair 파싱 실패: {exc}"]
+
+
+def phase2_structured_warning_codes(warnings):
+    """원시 브리핑·시장값 없이 구조화 실패 종류만 운영 로그에 남긴다."""
+    codes = []
+    for warning in (warnings or []):
+        text = str(warning)
+        if "'ledger'" in text or "ledger 객체 누락" in text:
+            codes.append("MISSING_LEDGER")
+        elif "Source Bundle PHASE1 사실 참조 오류" in text:
+            codes.append("FACT_REF_MISMATCH")
+        elif "4축 점수 누락" in text:
+            codes.append("AXIS_SCORES_MISSING")
+        elif "JSON" in text or "Expecting" in text:
+            codes.append("MALFORMED_JSON")
+        else:
+            codes.append("OTHER_STRUCTURED_FAILURE")
+    return sorted(set(codes)) or ["OTHER_STRUCTURED_FAILURE"]
 
 
 def extract_phase2_briefing_fallback(raw_json):
@@ -3032,7 +3082,10 @@ def run_phase2(phase1_result, symbol, exchange_name, phase1_canonical=None, phas
         raw_json, response_meta = call_gemini_api_with_retry(
             request_prompt, max_tokens=request_max_tokens,
             preferred_url=model_url if not is_lightweight_repair else repair_model_url, return_metadata=True,
-            response_json_schema=_load_phase2_response_schema(), allow_preferred_fallback=True,
+            response_json_schema=(
+                _load_phase2_ledger_repair_schema()
+                if is_lightweight_repair else _load_phase2_response_schema()
+            ), allow_preferred_fallback=True,
         )
         if isinstance(phase2_execution_metadata, dict):
             phase2_execution_metadata.clear()
@@ -3070,7 +3123,10 @@ def run_phase2(phase1_result, symbol, exchange_name, phase1_canonical=None, phas
                 prompt_tokens=response_meta.get("prompt_token_count", 0),
                 output_tokens=response_meta.get("output_token_count", 0),
                 total_tokens=response_meta.get("total_token_count", 0))
-        raw_result, structured_warnings = render_phase2_structured_response(raw_json, phase1_fact_registry)
+        raw_result, structured_warnings = (
+            render_phase2_ledger_repair_response(raw_json, provisional_fallback_briefing, phase1_fact_registry)
+            if is_lightweight_repair else render_phase2_structured_response(raw_json, phase1_fact_registry)
+        )
         if structured_warnings:
             # user_briefing이 있어도 ledger가 없거나 불완전하면, 이미 생성된 JSON만 재료로 한 번의 경량 repair를 먼저 시도한다.
             # 이 repair는 새 시장 판단을 만들지 않고 ledger·fact_ref 계약만 완성해 정상 결정값 카드를 복구한다.
@@ -3079,6 +3135,7 @@ def run_phase2(phase1_result, symbol, exchange_name, phase1_canonical=None, phas
                 observe(
                     "STRUCTURED_LEDGER_REPAIR_SCHEDULED", attempt=attempt + 1, rule_ids=last_rule_ids,
                     rule_subcodes=["P2S01"], has_user_briefing=bool(extract_phase2_briefing_fallback(raw_json)),
+                    structured_warning_codes=phase2_structured_warning_codes(structured_warnings),
                 )
                 provisional_fallback_briefing = extract_phase2_briefing_fallback(raw_json)
                 lightweight_repair_prompt = build_phase2_lightweight_repair_prompt(
@@ -3099,6 +3156,7 @@ def run_phase2(phase1_result, symbol, exchange_name, phase1_canonical=None, phas
                 observe(
                     "STRUCTURED_LEDGER_OBSERVED", attempt=attempt + 1, rule_ids=["P2S01"],
                     observation_codes=["LEDGER_REPAIR_EXHAUSTED"] + sorted(set(fallback_display_warnings)),
+                    structured_warning_codes=phase2_structured_warning_codes(structured_warnings),
                 )
                 observe("PUBLISHED", attempt=attempt + 1)
                 return fallback_display
