@@ -232,44 +232,37 @@ if not CANDLEVIEW_PROMPT_FULL:
     print("[WARN] 엔진 파일을 찾지 못해 기본 문자열로 대체합니다.")
 
 
-def build_phase_runtime_prompts(full_prompt):
-    """PHASE 1 데이터 카드와 PHASE 2 분석이 각자 필요한 엔진 절만 사용하게 분리한다.
+def build_standard_analysis_runtime_prompt(full_prompt):
+    """일반 지정코인 분석의 활성 엔진 규칙을 보존하고 history·FindCoin만 제외한다.
 
-    PHASE 1은 API 수집·품질·STAGE 0 카드 절만, PHASE 2는 프랙탈·Layer 3~5 분석 절만 받는다.
-    결함 이력과 FindCoin 전용 장은 특정 코인 일반 분석의 어느 phase에도 재주입하지 않는다.
-    사양 표식이 누락·재정렬된 경우 전체 사양을 두 phase에 그대로 반환해 규칙 유실을 막는다.
+    PHASE 1/2의 역할 분리는 사양의 실행 규칙과 각 호출의 추가 지시가 담당한다.
+    Layer 0~5를 PHASE별로 다시 잘라 Gemini의 정의·수식·서술 문맥이 누락될 위험은 만들지 않는다.
+    사양 표식이 누락·재정렬된 경우 전체 사양을 유지한다.
     """
     if not isinstance(full_prompt, str) or not full_prompt.strip():
-        return full_prompt, full_prompt
-    markers = {
-        "history": "📋 [결함 판정 이력 대장]",
-        "runtime": "(PA-VSA 전용 API 데이터 정밀 연산 엔진",
-        "fractal": "▶ Layer 0. 프랙탈 컨테이너 매트릭스",
-        "layer1": "=== 2. [Layer 1] 전역 표준 상수",
-        "stage0": "=== 7. [Layer 2] STAGE 0",
-        "layer3": "=== 8. [Layer 3] 해석 엔진",
-        "findcoin": "=== 14. FindCoin 플러그인 모듈",
-    }
-    positions = {name: full_prompt.find(marker) for name, marker in markers.items()}
-    ordered = [positions[name] for name in ("history", "runtime", "fractal", "layer1", "stage0", "layer3", "findcoin")]
-    if not (all(position >= 0 for position in ordered) and ordered == sorted(ordered)):
-        print("[WARN] PHASE별 prompt 경계를 확인하지 못해 전체 엔진 사양을 유지합니다.")
-        return full_prompt, full_prompt
-    preamble = full_prompt[:positions["history"]].strip()
-    phase_rules = full_prompt[positions["runtime"]:positions["fractal"]].strip()
-    stage0_rules = full_prompt[positions["layer1"]:positions["layer3"]].strip()
-    analysis_prerequisites = full_prompt[positions["fractal"]:positions["stage0"]].strip()
-    analysis_rules = full_prompt[positions["layer3"]:positions["findcoin"]].strip()
-    phase1_prompt = "\n\n".join((preamble, phase_rules, stage0_rules))
-    phase2_prompt = "\n\n".join((preamble, phase_rules, analysis_prerequisites, analysis_rules))
+        return full_prompt
+    history_marker = "📋 [결함 판정 이력 대장]"
+    runtime_marker = "(PA-VSA 전용 API 데이터 정밀 연산 엔진"
+    findcoin_marker = "=== 14. FindCoin 플러그인 모듈"
+    history = full_prompt.find(history_marker)
+    runtime = full_prompt.find(runtime_marker)
+    findcoin = full_prompt.find(findcoin_marker)
+    if not (0 <= history < runtime < findcoin):
+        print("[WARN] 표준 runtime profile 경계를 확인하지 못해 전체 엔진 사양을 유지합니다.")
+        return full_prompt
+    preamble = full_prompt[:history].strip()
+    active_runtime = full_prompt[runtime:findcoin].strip()
+    standard_prompt = "\n\n".join((preamble, active_runtime))
     print(
-        f"[INFO] PHASE별 runtime profile: P1 {len(phase1_prompt):,}자 / "
-        f"P2 {len(phase2_prompt):,}자 / 전체 {len(full_prompt):,}자"
+        f"[INFO] 일반 분석 표준 runtime profile: {len(standard_prompt):,}자 / "
+        f"전체 {len(full_prompt):,}자"
     )
-    return phase1_prompt, phase2_prompt
+    return standard_prompt
 
 
-CANDLEVIEW_PROMPT_PHASE1, CANDLEVIEW_PROMPT_PHASE2 = build_phase_runtime_prompts(CANDLEVIEW_PROMPT_FULL)
+CANDLEVIEW_PROMPT_STANDARD_ANALYSIS = build_standard_analysis_runtime_prompt(CANDLEVIEW_PROMPT_FULL)
+CANDLEVIEW_PROMPT_PHASE1 = CANDLEVIEW_PROMPT_STANDARD_ANALYSIS
+CANDLEVIEW_PROMPT_PHASE2 = CANDLEVIEW_PROMPT_STANDARD_ANALYSIS
 
 # ============================================================
 # 분석 세션 임시 저장소
