@@ -730,6 +730,11 @@ def validate_ohlcv_quality(ohlcv, tf, collected_at_utc):
     if not np.isfinite(numeric.to_numpy()).all():
         reasons.append("비유한 OHLCV 값 존재")
     timestamps = numeric["timestamp"].to_numpy()
+    # timestamp가 NaN/±inf이면 int()·날짜 변환이 불가능하다. 이후 예외로 전체 PHASE 1을 중단하지 않고
+    # 해당 TF만 품질결손으로 확정한다. 가격·거래량의 비유한값은 아래 reasons로 동일하게 결손 처리된다.
+    if not np.isfinite(timestamps).all():
+        quality["status"] = "데이터결손/판정불가"
+        return quality
     diffs = np.diff(timestamps)
     if np.any(diffs <= 0):
         reasons.append("timestamp 중복 또는 역행")
@@ -1733,7 +1738,15 @@ FINDCOIN_BOUNDARY_MARKERS = ["🥇", "🥈", "🥉"]
 # ============================================================
 # 텔레그램 메시지 전송 (일반 + 인라인 버튼 지원)
 # ============================================================
+def _telegram_response_ok(response):
+    try:
+        return bool(response.json().get("ok", False))
+    except Exception:
+        return bool(getattr(response, "status_code", 0) == 200)
+
+
 def send_telegram_message(chat_id, text, reply_markup=None, timeout=15):
+    """Telegram 전송 실패를 호출자 예외로 전파하지 않고 HTML→plain 1회 fallback의 성공 여부를 반환한다."""
     send_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": chat_id,
@@ -1743,25 +1756,32 @@ def send_telegram_message(chat_id, text, reply_markup=None, timeout=15):
     if reply_markup:
         payload["reply_markup"] = reply_markup
 
-    res = requests.post(send_url, json=payload, timeout=timeout)
     try:
-        ok = res.json().get("ok", False)
-    except Exception:
-        ok = res.status_code == 200
+        if _telegram_response_ok(requests.post(send_url, json=payload, timeout=timeout)):
+            return True
+    except Exception as exc:
+        print(f"[WARN] Telegram sendMessage HTML 전송 실패: {type(exc).__name__}")
 
-    if not ok:
-        payload.pop("parse_mode", None)
-        if reply_markup:
-            payload["reply_markup"] = reply_markup
-        requests.post(send_url, json=payload, timeout=timeout)
+    payload.pop("parse_mode", None)
+    try:
+        if _telegram_response_ok(requests.post(send_url, json=payload, timeout=timeout)):
+            return True
+    except Exception as exc:
+        print(f"[WARN] Telegram sendMessage plain fallback 실패: {type(exc).__name__}")
+    return False
 
 
 def answer_callback_query(callback_query_id, text=None):
+    """콜백 응답 전송 실패가 분석 세션 상태를 고착시키지 않도록 성공 여부만 반환한다."""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery"
     payload = {"callback_query_id": callback_query_id}
     if text:
         payload["text"] = text
-    requests.post(url, json=payload, timeout=10)
+    try:
+        return _telegram_response_ok(requests.post(url, json=payload, timeout=10))
+    except Exception as exc:
+        print(f"[WARN] Telegram answerCallbackQuery 실패: {type(exc).__name__}")
+        return False
 
 
 # ============================================================
@@ -1836,25 +1856,40 @@ def run_phase1(symbol_input, exchange_name, custom_tfs):
         tf_quality_list = []
         snapshot_events = []
         # TF 루프: OHLCV+RSI + TF별 Volume Delta(Plugin7, V003은 TF마다 다른 값을 요구)
+        # 한 TF의 수집 예외는 그 TF의 데이터결손으로만 국소화한다. 다른 정상 TF의 PHASE 1/2 경로는 계속 유지한다.
         for i, tf in enumerate(custom_tfs):
             tf_fetch_started = datetime.now(timezone.utc)
-            if tf == "1w":
-                # 주봉은 거래소 API 지원여부와 무관하게 항상 일봉을 직접 묶어 생성한다.
-                # 100주 의존 규칙에 필요한 Layer 1 SSOT 이력만큼 요청하고, 부족 반환은 품질 게이트가 격리한다.
-                if WEEKLY_HISTORY_DAYS is None:
-                    raise RuntimeError("WEEKLY_HISTORY_DAYS SSOT를 읽지 못해 주봉 수집을 시작할 수 없습니다")
-                daily_ohlcv = exchange_class.fetch_ohlcv(symbol, timeframe="1d", limit=WEEKLY_HISTORY_DAYS)
+            try:
+                if tf == "1w":
+                    # 주봉은 거래소 API 지원여부와 무관하게 항상 일봉을 직접 묶어 생성한다.
+                    # 100주 의존 규칙에 필요한 Layer 1 SSOT 이력만큼 요청하고, 부족 반환은 품질 게이트가 격리한다.
+                    if WEEKLY_HISTORY_DAYS is None:
+                        raise RuntimeError("WEEKLY_HISTORY_DAYS SSOT를 읽지 못해 주봉 수집을 시작할 수 없습니다")
+                    daily_ohlcv = exchange_class.fetch_ohlcv(symbol, timeframe="1d", limit=WEEKLY_HISTORY_DAYS)
+                    tf_fetch_finished = datetime.now(timezone.utc)
+                    daily_quality = validate_ohlcv_quality(daily_ohlcv, "1d", tf_fetch_finished)
+                    ohlcv = resample_daily_to_weekly(daily_ohlcv)
+                else:
+                    daily_quality = None
+                    ohlcv = exchange_class.fetch_ohlcv(symbol, timeframe=tf, limit=120)
+                    tf_fetch_finished = datetime.now(timezone.utc)
+                quality = validate_ohlcv_quality(ohlcv, tf, tf_fetch_finished)
+                if daily_quality and daily_quality["status"] == "데이터결손/판정불가":
+                    quality["status"] = "데이터결손/판정불가"
+                    quality["reasons"].append("주봉 파생 원천 1d " + "; ".join(daily_quality["reasons"]))
+            except Exception as tf_error:
                 tf_fetch_finished = datetime.now(timezone.utc)
-                daily_quality = validate_ohlcv_quality(daily_ohlcv, "1d", tf_fetch_finished)
-                ohlcv = resample_daily_to_weekly(daily_ohlcv)
-            else:
-                daily_quality = None
-                ohlcv = exchange_class.fetch_ohlcv(symbol, timeframe=tf, limit=120)
-                tf_fetch_finished = datetime.now(timezone.utc)
-            quality = validate_ohlcv_quality(ohlcv, tf, tf_fetch_finished)
-            if daily_quality and daily_quality["status"] == "데이터결손/판정불가":
-                quality["status"] = "데이터결손/판정불가"
-                quality["reasons"].append("주봉 파생 원천 1d " + "; ".join(daily_quality["reasons"]))
+                quality = {
+                    "tf": tf,
+                    "received_bars": 0,
+                    "completed_bars": 0,
+                    "last_source_timestamp_ms": None,
+                    "expected_interval_seconds": timeframe_seconds(tf),
+                    "standard_target_completed_bars": DATA_MIN_COMPLETED_BARS,
+                    "status": "데이터결손/판정불가",
+                    "history_note": "",
+                    "reasons": [f"OHLCV 수집 실패: {type(tf_error).__name__}"],
+                }
             quality["fetch_started_utc"] = tf_fetch_started.isoformat(timespec="seconds") + "Z"
             quality["fetch_finished_utc"] = tf_fetch_finished.isoformat(timespec="seconds") + "Z"
             tf_quality_list.append(quality)
@@ -1939,6 +1974,23 @@ def run_phase1(symbol_input, exchange_name, custom_tfs):
                 payload += f"source: {tf_delta_info.get('source')} | last_Delta_Ratio: {tf_delta_info.get('last_delta_ratio'):+.4f}\n"
             else:
                 payload += "[거래소 미지원 또는 데이터결손] Volume Delta 수집 불가\n"
+
+        # 다중 TF 분석의 최소 계약(2~4개)상 정상 OHLCV가 2개 미만이면 방향·가격경로를 구성하지 않는다.
+        # 단일 TF API 예외 때문에 정상 TF를 버리지 않으며, 2개 이상이면 아래 PHASE 1/2 경로를 그대로 계속한다.
+        usable_tf_count = sum(quality.get("status") != "데이터결손/판정불가" for quality in tf_quality_list)
+        if usable_tf_count < 2:
+            unavailable_lines = [
+                f"• {quality.get('tf')}: " + "; ".join(quality.get("reasons") or ["정상 OHLCV 확보 실패"])
+                for quality in tf_quality_list
+                if quality.get("status") == "데이터결손/판정불가"
+            ]
+            return (
+                "[다중 TF 원천 수집 미완료]\n"
+                f"정상 OHLCV가 {usable_tf_count}개여서 최소 2개 TF 분석 계약을 충족하지 못했습니다.\n"
+                + "\n".join(unavailable_lines)
+                + "\n정상 TF는 버리지 않았습니다. 잠시 후 같은 명령으로 다시 수집해 주세요.",
+                None, None, None,
+            )
 
         # OI / Whale Wall — 심볼 단위 1회 (TF 무관 1회성 스냅샷, V003 정식모드 보조지표 블록 뒤 배치 대상)
         oi_fetch_started = datetime.now(timezone.utc)
@@ -2716,14 +2768,19 @@ def try_deterministic_phase2_repair(text, warnings):
     return repaired, metadata
 
 
-def build_phase2_lightweight_repair_prompt(provisional_json, warnings):
-    """원천·전체 명세를 재주입하지 않는 제한된 JSON repair prompt를 만든다."""
+def build_phase2_lightweight_repair_prompt(provisional_json, warnings, phase1_fact_refs=None):
+    """원천·전체 명세를 재주입하지 않고 기존 자연어와 ledger 계약만 복구하는 제한 prompt를 만든다."""
     safe_warnings = "\n".join(f"- {str(warning)[:240]}" for warning in (warnings or [])[:12])
+    safe_fact_refs = json.dumps(sorted(str(item) for item in (phase1_fact_refs or [])), ensure_ascii=False)
     return (
         "[PHASE 2 경량 검증 repair]\n"
         "아래 provisional JSON만 수정하십시오. 새 수치·새 원천 사실·새 시나리오를 추가하지 마십시오. "
-        "검증오류와 직접 관련된 JSON 필드만 고치고, 동일 response JSON schema의 완전한 JSON 하나만 반환하십시오.\n\n"
+        "user_briefing이 이미 있으면 그 문자열은 한 글자도 바꾸지 말고 그대로 유지하십시오. "
+        "ledger가 없거나 불완전하면 기존 판단과 같은 결론의 완전한 ledger 객체만 추가·보완하십시오. "
+        "가격경로·점수·확률 입력은 provisional JSON의 기존 판단에서만 가져오며, 허용된 fact_ref 목록 밖의 참조는 쓰지 마십시오. "
+        "동일 response JSON schema의 완전한 JSON 하나만 반환하십시오.\n\n"
         "[검증오류]\n" + safe_warnings + "\n\n"
+        "[허용 PHASE 1 fact_ref]\n" + safe_fact_refs + "\n\n"
         "[provisional JSON]\n" + str(provisional_json)
     )
 
@@ -2860,6 +2917,7 @@ def run_phase2(phase1_result, symbol, exchange_name, phase1_canonical=None, phas
     canonical_warnings = validate_phase1_canonical(phase1_canonical) if phase1_canonical else ["PHASE1 canonical 누락"]
     input_warnings = validate_phase2_input_provenance(phase2_input_provenance, phase1_result, phase1_canonical)
     model_url = (phase1_model or {}).get("model_url")
+    repair_model_url = model_url
     precheck_warnings = list(canonical_warnings) + list(input_warnings)
     if not model_url:
         precheck_warnings.append("P2I04 PHASE1 성공 모델 provenance 누락")
@@ -2889,6 +2947,7 @@ def run_phase2(phase1_result, symbol, exchange_name, phase1_canonical=None, phas
         f"direction은 상방·하방·중립, role은 결정·국면·보조·가격경로, axis는 S_1~S_4 중 하나만 사용하십시오."
     )
     lightweight_repair_prompt = None
+    provisional_fallback_briefing = ""
     last_verified = "[검증보류 — PHASE 2 결과 없음]"
     last_rule_ids = ["P2V99"]
     for attempt in range(2):
@@ -2902,7 +2961,8 @@ def run_phase2(phase1_result, symbol, exchange_name, phase1_canonical=None, phas
             )
         observe("CALL_ATTEMPT", attempt=attempt + 1, request_kind="lightweight_repair" if is_lightweight_repair else "full_phase2")
         raw_json, response_meta = call_gemini_api_with_retry(
-            request_prompt, max_tokens=request_max_tokens, preferred_url=model_url, return_metadata=True,
+            request_prompt, max_tokens=request_max_tokens,
+            preferred_url=model_url if not is_lightweight_repair else repair_model_url, return_metadata=True,
             response_json_schema=_load_phase2_response_schema(), allow_preferred_fallback=True,
         )
         if isinstance(phase2_execution_metadata, dict):
@@ -2913,11 +2973,28 @@ def run_phase2(phase1_result, symbol, exchange_name, phase1_canonical=None, phas
             rule_id = "P2M02" if failure_kind == "quota_exhausted" else "P2M03"
             observe("MODEL_HELD", attempt=attempt + 1, rule_ids=[rule_id], failure_kind=failure_kind,
                     retry_after_seconds=response_meta.get("retry_after_seconds"))
+            # 첫 응답의 자연어가 정상이라면 ledger repair 호출 실패가 그 분석 전체를 지우면 안 된다.
+            if is_lightweight_repair and provisional_fallback_briefing:
+                fallback_display, fallback_display_warnings = render_verified_phase2_decision_blocks(
+                    provisional_fallback_briefing,
+                    None,
+                    symbol.rsplit("/", 1)[-1] if "/" in symbol else "",
+                    all_validation_warnings=[f"P2S01 ledger repair 호출 실패: {failure_kind}"],
+                    display_warnings=["구조화 ledger 복구 미완료"],
+                )
+                observe(
+                    "STRUCTURED_LEDGER_OBSERVED", attempt=attempt + 1, rule_ids=["P2S01", rule_id],
+                    observation_codes=["LEDGER_REPAIR_CALL_FAILED"] + sorted(set(fallback_display_warnings)),
+                )
+                observe("PUBLISHED", attempt=attempt + 1)
+                return fallback_display
             if failure_kind == "quota_exhausted":
                 wait_seconds = response_meta.get("retry_after_seconds")
                 wait_hint = f" 약 {wait_seconds}초 후" if wait_seconds else " 잠시 후"
                 return "[검증보류 — PHASE 2 승인 모델 할당량 도달]" + wait_hint + " 재시도해 주세요."
             return "[검증보류 — PHASE 2 승인 모델 호출 실패]"
+        # P2S01 repair는 첫 응답을 실제로 만든 모델을 우선 사용해 불필요한 roster 재탐색을 피한다.
+        repair_model_url = response_meta.get("model_url") or repair_model_url
         observe("MODEL_RESPONSE", attempt=attempt + 1, model_id=response_meta.get("model_id", ""),
                 fallback_used=bool(response_meta.get("fallback_used")),
                 selection_source=response_meta.get("selection_source", ""),
@@ -2926,27 +3003,39 @@ def run_phase2(phase1_result, symbol, exchange_name, phase1_canonical=None, phas
                 total_tokens=response_meta.get("total_token_count", 0))
         raw_result, structured_warnings = render_phase2_structured_response(raw_json, phase1_fact_registry)
         if structured_warnings:
-            fallback_briefing = extract_phase2_briefing_fallback(raw_json)
+            # user_briefing이 있어도 ledger가 없거나 불완전하면, 이미 생성된 JSON만 재료로 한 번의 경량 repair를 먼저 시도한다.
+            # 이 repair는 새 시장 판단을 만들지 않고 ledger·fact_ref 계약만 완성해 정상 결정값 카드를 복구한다.
+            if not is_lightweight_repair:
+                last_rule_ids = classify_phase2_verification_warnings(structured_warnings, structured=True)
+                observe(
+                    "STRUCTURED_LEDGER_REPAIR_SCHEDULED", attempt=attempt + 1, rule_ids=last_rule_ids,
+                    rule_subcodes=["P2S01"], has_user_briefing=bool(extract_phase2_briefing_fallback(raw_json)),
+                )
+                provisional_fallback_briefing = extract_phase2_briefing_fallback(raw_json)
+                lightweight_repair_prompt = build_phase2_lightweight_repair_prompt(
+                    raw_json, structured_warnings, fact_refs_for_prompt
+                )
+                continue
+            # 경량 repair까지 실패했을 때만 자연어를 보존하는 기존 fallback을 사용한다.
+            fallback_briefing = extract_phase2_briefing_fallback(raw_json) or provisional_fallback_briefing
             if fallback_briefing:
                 fallback_display, fallback_display_warnings = render_verified_phase2_decision_blocks(
                     fallback_briefing,
                     None,
                     symbol.rsplit("/", 1)[-1] if "/" in symbol else "",
                     all_validation_warnings=structured_warnings,
-                    display_warnings=["구조화 ledger 검증보류"],
+                    display_warnings=["구조화 ledger 복구 미완료"],
                 )
                 observe(
                     "STRUCTURED_LEDGER_OBSERVED", attempt=attempt + 1, rule_ids=["P2S01"],
-                    observation_codes=["LEDGER_ABSENT"] + sorted(set(fallback_display_warnings)),
+                    observation_codes=["LEDGER_REPAIR_EXHAUSTED"] + sorted(set(fallback_display_warnings)),
                 )
                 observe("PUBLISHED", attempt=attempt + 1)
                 return fallback_display
-            # user_briefing 자체가 없을 때만 한 번의 경량 repair를 허용한다.
             last_rule_ids = classify_phase2_verification_warnings(structured_warnings, structured=True)
             observe("STRUCTURED_BRIEFING_HELD", attempt=attempt + 1, rule_ids=last_rule_ids, rule_subcodes=["P2S01"])
-            last_verified = "[검증보류 — 사용자 브리핑 누락]\n" + "\n".join(f"• {warning}" for warning in structured_warnings)
-            lightweight_repair_prompt = build_phase2_lightweight_repair_prompt(raw_json, structured_warnings)
-            continue
+            last_verified = "[검증보류 — 사용자 브리핑 및 구조화 ledger 누락]\n" + "\n".join(f"• {warning}" for warning in structured_warnings)
+            break
 
         normalized_result, normalization_meta = normalize_evidence_ledger_for_publication(raw_result)
         last_verified = verify_and_fix_phase2(normalized_result)
