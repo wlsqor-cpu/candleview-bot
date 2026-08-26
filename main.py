@@ -1585,6 +1585,7 @@ def format_supplement_display(supplement, symbol, exchange_display):
 STATIC_APPROVED_MODELS = [
     {"model_id": "gemini-3.7-flash", "selection_source": "고정 승인 1차", "rank": 0},
     {"model_id": "gemini-3.6-flash", "selection_source": "고정 승인 fallback", "rank": 1},
+    {"model_id": "gemini-3.5-flash", "selection_source": "긴급 fallback", "rank": 2},
 ]
 
 
@@ -1644,7 +1645,8 @@ def model_execution_hold_message(metadata):
 
 
 def get_approved_model_roster():
-    """분석 실행에는 수동 승인된 두 고정 모델만 순서대로 사용한다.
+    """분석 실행에는 수동 승인된 고정 모델만 순서대로 사용한다.
+    3.5 Flash는 3.7·3.6이 quota/503으로 실패했을 때만 도달하는 긴급 fallback이다.
     모델 목록 탐색·상태 캐시·fixture 호출은 일반 분석 경로에 존재하지 않는다."""
     selected = []
     for item in sorted(STATIC_APPROVED_MODELS, key=lambda row: (int(row["rank"]), row["model_id"])):
