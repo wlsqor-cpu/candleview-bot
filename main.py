@@ -2808,8 +2808,12 @@ def _is_unverified_decision_value_line(line):
 
 
 def _is_empty_probability_placeholder(line):
-    """Python 카드가 확률을 표시한 뒤 모델이 남긴 값 없는 placeholder만 제거한다."""
-    return bool(re.fullmatch(r"\s*(?:[➔•-]\s*)?\(확률\)\s*", str(line or "")))
+    """Python 카드가 확률을 표시한 뒤 모델이 남긴 숫자 없는 placeholder만 제거한다."""
+    text = str(line or "")
+    return bool(re.fullmatch(
+        r"\s*(?:[➔•-]\s*)?\(확률\s*%?(?:\s*(?:—|--|-)\s*참고용,\s*백테스트\s*검증치\s*아님)?\s*\)",
+        text,
+    ))
 
 
 def _is_empty_route_context_label(line):
@@ -3230,7 +3234,7 @@ def run_phase2(phase1_result, symbol, exchange_name, phase1_canonical=None, phas
         f"plugin_context.nearest_support_wall과 nearest_resistance_wall이 모두 있으면 현재가 인접 매수·매도벽을 각각 한 번씩 조건부 수급 경계로 결속하십시오. Volume Delta·OI 상태가 ‘근거에 사용 금지’이면 5️⃣ 또는 6️⃣에 결손/비적용 사실만 한 문장으로 밝히고 방향·가격 근거로 사용하지 마십시오. "
         f"data_quality_boundaries에 ‘데이터결손/판정불가’가 있으면 그 TF의 해당 지표만 판정불가라고 정확히 쓰고, TF 전체 데이터 결손으로 과장하지 마십시오. 슬롯의 값·TF·상태를 바꾸거나 없는 숫자를 보완하지 말고, 모든 슬롯을 기계적으로 나열하지도 마십시오. "
         f"'시스템 무결성 검증 완료', 'API Direct Data Parsing 완료', 'Layer 5-B 인라인 검증 100% 통과' 태그는 절대 작성하지 마십시오. "
-        f"ledger에는 같은 결론의 검증용 원장과 기존 Final_신뢰도점수(0~5.9)를 final_confidence_score로 작성하십시오. ledger.bundles의 각 항목은 문자열이 아니라 "
+        f"ledger에는 같은 결론의 검증용 원장과 기존 Final_신뢰도점수(0~5.9)를 final_confidence_score로 작성하십시오. ledger.price_path는 횡보가 아니면 P_entry=수치 | P_inv=수치 | P_target_1=수치 | P_target_2=수치 네 필드를 각각 한 번씩 반드시 작성하고, 방향의 가격 순서와 일치시켜야 합니다. ledger.bundles의 각 항목은 문자열이 아니라 "
         f"tf·window·fact·fact_ref·direction·role·axis 일곱 필드를 모두 가진 JSON 객체여야 합니다. "
         f"fact_ref는 반드시 위 PHASE 1 사실 참조 목록의 값 하나를 사용하고 tf와 일치해야 합니다. fact는 해당 참조의 설명용 복사본입니다. "
         f"direction은 상방·하방·중립, role은 결정·국면·보조·가격경로, axis는 S_1~S_4 중 하나만 사용하십시오."
@@ -3364,6 +3368,24 @@ def run_phase2(phase1_result, symbol, exchange_name, phase1_canonical=None, phas
             )
         clean_briefing = strip_phase2_validation_log(last_verified)
         display_contract, display_warnings = build_phase2_display_contract(normalized_result)
+        price_path_repair_warnings = [
+            warning for warning in display_warnings
+            if warning in ("결정값 표시 보류: 가격경로 필수값 누락", "결정값 표시 보류: 가격경로 파싱 오류")
+        ]
+        if price_path_repair_warnings and not is_lightweight_repair:
+            # 구조화 JSON은 통과했으나 가격경로만 불완전한 경우도 기존 P2S01 ledger-only repair를 한 번 사용한다.
+            # provisional 자연어와 PHASE1 canonical만 전달하며, 새 시장 데이터·새 시나리오는 만들지 않는다.
+            provisional_fallback_briefing = extract_phase2_briefing_fallback(raw_json)
+            observe(
+                "PRICE_PATH_LEDGER_REPAIR_SCHEDULED", attempt=attempt + 1, rule_ids=["P2V03"],
+                rule_subcodes=["P2S01"], observation_codes=["PRICE_PATH_REPAIRABLE"],
+                has_user_briefing=bool(provisional_fallback_briefing),
+            )
+            lightweight_repair_prompt = build_phase2_lightweight_repair_prompt(
+                raw_json, price_path_repair_warnings, fact_refs_for_prompt,
+                phase1_result=phase1_result, phase1_canonical=phase1_canonical,
+            )
+            continue
         published_briefing, display_warnings = render_verified_phase2_decision_blocks(
             clean_briefing,
             display_contract,
