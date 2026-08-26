@@ -2812,11 +2812,22 @@ def _is_empty_probability_placeholder(line):
     return bool(re.fullmatch(r"\s*(?:[➔•-]\s*)?\(확률\)\s*", str(line or "")))
 
 
+def _is_empty_route_context_label(line):
+    """값·TF·조건이 전혀 없는 경로 라벨은 보조 근거가 아니므로 빈 행으로 발행하지 않는다."""
+    return bool(re.fullmatch(
+        r"\s*(?:[➔•-]\s*)?(?:현재가|비어있는\s*매물\s*공백대\s*\[FVG\]|주요\s*돌파선|"
+        r"지지·저항\s*역할\s*전환선\s*\[Role Reversal\]|무효화\s*손절선\s*이탈|다음\s*매물대)\s*",
+        str(line or ""),
+    ))
+
+
 def _retain_route_context(body):
-    """핵심 결정 수치·빈 확률 placeholder만 제거하고 FVG·Role Reversal 등 보조 설명은 보존한다."""
+    """검증되지 않은 결정값·빈 확률·값 없는 보조 라벨만 제거하고 실제 FVG·Role Reversal 근거는 보존한다."""
     lines = [
         line for line in (body or "").splitlines()
-        if not _is_unverified_decision_value_line(line) and not _is_empty_probability_placeholder(line)
+        if not _is_unverified_decision_value_line(line)
+        and not _is_empty_probability_placeholder(line)
+        and not _is_empty_route_context_label(line)
     ]
     return "\n".join(lines).strip()
 
@@ -2898,6 +2909,26 @@ def render_verified_phase2_decision_blocks(text, contract, quote, all_validation
     if not all_validation_warnings and not display_warnings:
         rendered = rendered.rstrip() + "\n\n시스템 무결성 검증 완료\n■ API Direct Data Parsing 완료\n■ Layer 5-B 인라인 검증 100% 통과"
     return rendered.rstrip(), display_warnings
+
+
+def phase2_briefing_completeness_observations(text):
+    """TF 제목·방향만 남은 얇은 브리핑을 내부 관측하되 정상 카드 발행은 막지 않는다."""
+    source = str(text or "")
+    heading_pattern = re.compile(
+        r"(?ms)^\s*▶️\s*(?P<tf>1w|1d|4h|1h|15m|5m)\s*타임\s*프레임\s*분석\s*\n(?P<body>.*?)(?=^\s*▶️\s*(?:1w|1d|4h|1h|15m|5m)\s*타임\s*프레임\s*분석|^\s*5️⃣|\Z)"
+    )
+    observations = []
+    for match in heading_pattern.finditer(source):
+        body = match.group("body")
+        meaningful = []
+        for line in body.splitlines():
+            normalized = line.strip().lstrip("> ").strip()
+            if not normalized or normalized.startswith("방향성 판정:"):
+                continue
+            meaningful.append(normalized)
+        if len(" ".join(meaningful)) < 24:
+            observations.append(f"BRIEFING_THIN_TF:{match.group('tf')}")
+    return observations
 
 
 def try_deterministic_phase2_repair(text, warnings):
@@ -3192,8 +3223,9 @@ def run_phase2(phase1_result, symbol, exchange_name, phase1_canonical=None, phas
         f"반드시 JSON으로 응답하십시오. user_briefing에는 기존 1️⃣~6️⃣ 자연어 브리핑 전체를 충분한 문맥으로 작성하고, INTERNAL_EVIDENCE_LEDGER 표식은 넣지 마십시오. "
         f"다만 1️⃣의 메인·대체 시나리오 경로에서는 가격·확률 숫자를 직접 쓰지 말고, 각 라벨과 보조 레벨(FVG·Role Reversal·돌파선·다음 매물대)만 작성하십시오. "
         f"Python이 검증 완료된 ledger 값으로 진입·무효화·목표가·확률을 표시합니다. "
-        f"[필수 근거 슬롯 서술 계약] 문체와 문단 구성은 자연스럽게 작성하되, daily_context.overlap_zone이 실제 값이면 그 1d 구간을 대체 시나리오 Role Reversal에 TF 라벨과 함께 숫자 또는 범위로 한 번 명시하십시오. 값이 없을 때만 role_reversal_references의 실제 구조상태·돌파 값을 사용하십시오. "
+        f"[필수 근거 슬롯 서술 계약] 문체와 문단 구성은 자연스럽게 작성하되, daily_context.overlap_zone이 실제 값이면 그 1d 구간을 대체 시나리오 Role Reversal에 TF 라벨과 함께 숫자 또는 범위로 한 번 명시하십시오. 값이 없을 때만 role_reversal_references의 실제 구조상태·돌파 값을 사용하십시오. FVG·돌파선·Role Reversal·다음 매물대는 PHASE 1의 TF와 실제 값 또는 범위를 함께 쓸 수 있을 때만 경로에 넣고, 값이 없으면 해당 라벨 줄 자체를 쓰지 마십시오. "
         f"daily_context의 구조·패턴·거래량/감속·F코드는 1d 설명 또는 TF 상관관계에 한 문장으로 결속하십시오. short_tf_zones는 4h/1h 설명 또는 TF 상관관계에서 실제 FVG·세력 매물대·중첩 매물대 중 분석에 필요한 최대 두 구간만 TF 라벨과 함께 사용하십시오. "
+        f"[개별 TF 완결성 계약] 정상 또는 부분수집 TF마다 4️⃣에서 제목·방향성 판정만 남기지 말고, PHASE 1에 실제 있는 구조/패턴, 거래량·감속, RSI·다이버전스, F코드, FVG·OB·중첩 구간 중 최소 두 근거를 TF와 함께 1~2문장으로 결속하십시오. 특정 근거가 없으면 없는 수치를 만들지 말고 그 항목만 언급하지 마십시오. 데이터결손/판정불가 TF만 그 정확한 결손 사유를 쓰십시오. "
         f"서로 다른 TF의 구간을 하나의 원천 구간처럼 합치거나, 1h F2·4h F3처럼 TF별 F코드를 다른 TF에 귀속하지 마십시오. 복수 TF 구간을 함께 말할 때는 ‘복합 지지/저항대’라고 하고 각 TF 값을 분리해 쓰십시오. "
         f"plugin_context.nearest_support_wall과 nearest_resistance_wall이 모두 있으면 현재가 인접 매수·매도벽을 각각 한 번씩 조건부 수급 경계로 결속하십시오. Volume Delta·OI 상태가 ‘근거에 사용 금지’이면 5️⃣ 또는 6️⃣에 결손/비적용 사실만 한 문장으로 밝히고 방향·가격 근거로 사용하지 마십시오. "
         f"data_quality_boundaries에 ‘데이터결손/판정불가’가 있으면 그 TF의 해당 지표만 판정불가라고 정확히 쓰고, TF 전체 데이터 결손으로 과장하지 마십시오. 슬롯의 값·TF·상태를 바꾸거나 없는 숫자를 보완하지 말고, 모든 슬롯을 기계적으로 나열하지도 마십시오. "
@@ -3343,6 +3375,12 @@ def run_phase2(phase1_result, symbol, exchange_name, phase1_canonical=None, phas
             observe(
                 "DISPLAY_CONTRACT_OBSERVED", attempt=attempt + 1, rule_ids=["P2D01"],
                 observation_codes=sorted(set(display_warnings)),
+            )
+        completeness_observations = phase2_briefing_completeness_observations(published_briefing)
+        if completeness_observations:
+            observe(
+                "BRIEFING_COMPLETENESS_OBSERVED", attempt=attempt + 1, rule_ids=["P2D02"],
+                observation_codes=sorted(set(completeness_observations)),
             )
         observe("PUBLISHED", attempt=attempt + 1)
         return published_briefing
