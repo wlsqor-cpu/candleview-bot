@@ -2928,22 +2928,86 @@ def render_verified_phase2_decision_blocks(text, contract, quote, all_validation
     return rendered.rstrip(), display_warnings
 
 
-def phase2_briefing_completeness_observations(text):
-    """TF 제목·방향만 남은 얇은 브리핑을 내부 관측하되 정상 카드 발행은 막지 않는다."""
-    source = str(text or "")
-    heading_pattern = re.compile(
-        r"(?ms)^\s*▶️\s*(?P<tf>1w|1d|4h|1h|15m|5m)\s*타임\s*프레임\s*분석\s*\n(?P<body>.*?)(?=^\s*▶️\s*(?:1w|1d|4h|1h|15m|5m)\s*타임\s*프레임\s*분석|^\s*5️⃣|\Z)"
+TF_ANALYSIS_HEADING_PATTERN = re.compile(
+    r"(?ms)(?P<heading>^\s*▶️\s*(?P<tf>1w|1d|4h|1h|15m|5m)\s*타임\s*프레임\s*분석\s*\n)(?P<body>.*?)(?=^\s*▶️\s*(?:1w|1d|4h|1h|15m|5m)\s*타임\s*프레임\s*분석|^\s*5️⃣|\Z)"
+)
+
+
+def _phase2_tf_body_lines(body):
+    """TF 제목 다음의 유효 행과 방향성 판정 행 위치를 분리한다."""
+    lines = str(body or "").splitlines()
+    normalized = [line.strip().lstrip("> ").strip() for line in lines]
+    direction_index = next(
+        (index for index, value in enumerate(normalized) if value.startswith("방향성 판정:")),
+        None,
     )
-    observations = []
-    for match in heading_pattern.finditer(source):
+    return lines, normalized, direction_index
+
+
+def _phase2_tf_evidence_units(body):
+    """방향성 판정 뒤의 독립 근거 문장·행 수를 센다. 제목은 근거가 아니다."""
+    _, normalized, direction_index = _phase2_tf_body_lines(body)
+    if direction_index is None:
+        return 0
+    narrative_lines = [value for value in normalized[direction_index + 1:] if value]
+    narrative = " ".join(narrative_lines)
+    sentence_count = len(re.findall(r"[.!?](?=\s|$)", narrative))
+    return max(len(narrative_lines), sentence_count)
+
+
+def _phase2_tf_backfill_facts(tf, body, phase1_fact_registry, required_count):
+    """PHASE 1 registry의 같은 TF 사실만 사용해 모자란 본문 근거 행을 만든다."""
+    if required_count <= 0 or not isinstance(phase1_fact_registry, dict):
+        return []
+    source = str(body or "")
+    selected = []
+    seen_values = set()
+    for entry in phase1_fact_registry.values():
+        if not isinstance(entry, dict) or entry.get("tf") != tf:
+            continue
+        label = str(entry.get("label") or "").strip()
+        value = str(entry.get("value") or "").strip()
+        if not label or not value or value in source or value in seen_values:
+            continue
+        selected.append(f"근거: [{label}] {value}")
+        seen_values.add(value)
+        if len(selected) >= required_count:
+            break
+    return selected
+
+
+def ensure_phase2_tf_narrative_completeness(text, phase1_fact_registry):
+    """제목·방향만 남은 TF에만 PHASE 1 사실 행을 보완하며 카드 발행은 막지 않는다."""
+    source = str(text or "")
+    backfill_observations = []
+
+    def replace(match):
+        tf = match.group("tf")
         body = match.group("body")
-        meaningful = []
-        for line in body.splitlines():
-            normalized = line.strip().lstrip("> ").strip()
-            if not normalized or normalized.startswith("방향성 판정:"):
-                continue
-            meaningful.append(normalized)
-        if len(" ".join(meaningful)) < 24:
+        evidence_units = _phase2_tf_evidence_units(body)
+        if evidence_units >= 2:
+            return match.group("heading") + body
+        lines, _, direction_index = _phase2_tf_body_lines(body)
+        if direction_index is None:
+            return match.group("heading") + body
+        facts = _phase2_tf_backfill_facts(tf, body, phase1_fact_registry, 2 - evidence_units)
+        if not facts:
+            return match.group("heading") + body
+        trailing_newlines = re.search(r"\n*$", body).group(0)
+        rendered_lines = list(lines)
+        rendered_lines[direction_index + 1:direction_index + 1] = facts
+        rendered_body = "\n".join(rendered_lines).rstrip("\n") + trailing_newlines
+        backfill_observations.append(f"TF_EVIDENCE_BACKFILLED:{tf}:{len(facts)}")
+        return match.group("heading") + rendered_body
+
+    return TF_ANALYSIS_HEADING_PATTERN.sub(replace, source), backfill_observations
+
+
+def phase2_briefing_completeness_observations(text):
+    """TF 제목·방향만 남거나 방향 아래 근거가 한 개 이하인 경우만 내부 관측한다."""
+    observations = []
+    for match in TF_ANALYSIS_HEADING_PATTERN.finditer(str(text or "")):
+        if _phase2_tf_evidence_units(match.group("body")) < 2:
             observations.append(f"BRIEFING_THIN_TF:{match.group('tf')}")
     return observations
 
@@ -3242,7 +3306,7 @@ def run_phase2(phase1_result, symbol, exchange_name, phase1_canonical=None, phas
         f"Python이 검증 완료된 ledger 값으로 진입·무효화·목표가·확률을 표시합니다. "
         f"[필수 근거 슬롯 서술 계약] 문체와 문단 구성은 자연스럽게 작성하되, daily_context.overlap_zone이 실제 값이면 그 1d 구간을 대체 시나리오 Role Reversal에 TF 라벨과 함께 숫자 또는 범위로 한 번 명시하십시오. 값이 없을 때만 role_reversal_references의 실제 구조상태·돌파 값을 사용하십시오. FVG·돌파선·Role Reversal·다음 매물대는 PHASE 1의 TF와 실제 값 또는 범위를 함께 쓸 수 있을 때만 경로에 넣고, 값이 없으면 해당 라벨 줄 자체를 쓰지 마십시오. "
         f"daily_context의 구조·패턴·거래량/감속·F코드는 1d 설명 또는 TF 상관관계에 한 문장으로 결속하십시오. short_tf_zones는 4h/1h 설명 또는 TF 상관관계에서 실제 FVG·세력 매물대·중첩 매물대 중 분석에 필요한 최대 두 구간만 TF 라벨과 함께 사용하십시오. "
-        f"[개별 TF 완결성 계약] 정상 또는 부분수집 TF마다 4️⃣에서 제목·방향성 판정만 남기지 말고, PHASE 1에 실제 있는 구조/패턴, 거래량·감속, RSI·다이버전스, F코드, FVG·OB·중첩 구간 중 최소 두 근거를 TF와 함께 1~2문장으로 결속하십시오. 특정 근거가 없으면 없는 수치를 만들지 말고 그 항목만 언급하지 마십시오. 데이터결손/판정불가 TF만 그 정확한 결손 사유를 쓰십시오. "
+        f"[개별 TF 완결성 계약] 정상 또는 부분수집 TF마다 4️⃣에서 제목·방향성 판정만 남기지 말고, PHASE 1에 실제 있는 구조/패턴, 거래량·감속, RSI·다이버전스, F코드, FVG·OB·중첩 구간 중 최소 두 근거를 TF와 함께 1~2문장으로 결속하십시오. 제목 요약 문구와 방향성 판정 행은 근거 수에 포함하지 말고, 방향성 판정 다음에 실제 근거 문장을 작성하십시오. 특정 근거가 없으면 없는 수치를 만들지 말고 그 항목만 언급하지 마십시오. 데이터결손/판정불가 TF만 그 정확한 결손 사유를 쓰십시오. "
         f"서로 다른 TF의 구간을 하나의 원천 구간처럼 합치거나, 1h F2·4h F3처럼 TF별 F코드를 다른 TF에 귀속하지 마십시오. 복수 TF 구간을 함께 말할 때는 ‘복합 지지/저항대’라고 하고 각 TF 값을 분리해 쓰십시오. "
         f"plugin_context.nearest_support_wall과 nearest_resistance_wall이 모두 있으면 현재가 인접 매수·매도벽을 각각 한 번씩 조건부 수급 경계로 결속하십시오. Volume Delta·OI 상태가 ‘근거에 사용 금지’이면 5️⃣ 또는 6️⃣에 결손/비적용 사실만 한 문장으로 밝히고 방향·가격 근거로 사용하지 마십시오. "
         f"data_quality_boundaries에 ‘데이터결손/판정불가’가 있으면 그 TF의 해당 지표만 판정불가라고 정확히 쓰고, TF 전체 데이터 결손으로 과장하지 마십시오. 슬롯의 값·TF·상태를 바꾸거나 없는 숫자를 보완하지 말고, 모든 슬롯을 기계적으로 나열하지도 마십시오. "
@@ -3406,6 +3470,14 @@ def run_phase2(phase1_result, symbol, exchange_name, phase1_canonical=None, phas
             all_validation_warnings=list(validation_warnings) + list(provenance_warnings),
             display_warnings=display_warnings,
         )
+        published_briefing, tf_backfill_observations = ensure_phase2_tf_narrative_completeness(
+            published_briefing, phase1_fact_registry
+        )
+        if tf_backfill_observations:
+            observe(
+                "TF_EVIDENCE_BACKFILLED", attempt=attempt + 1, rule_ids=["P2D02"],
+                observation_codes=sorted(set(tf_backfill_observations)),
+            )
         if display_warnings:
             observe(
                 "DISPLAY_CONTRACT_OBSERVED", attempt=attempt + 1, rule_ids=["P2D01"],
