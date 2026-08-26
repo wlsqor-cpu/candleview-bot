@@ -1808,14 +1808,21 @@ def call_gemini_api_with_retry(full_prompt, max_tokens=16384, preferred_url=None
                     last_failure_kind = f"http_{res.status_code}"
                     print(f"[WARN] Gemini 응답 코드: {res.status_code}")
                     time.sleep(1)
+            except requests.exceptions.Timeout as e:
+                # PHASE 2 read timeout은 모델 품질·원천·수식 오류가 아니라 API 응답 미도달이다.
+                # 승인 roster의 뒤 순위만 사용하는 결속을 유지한 채 다음 모델로 전진할 수 있게 별도 분류한다.
+                last_failure_kind = "read_timeout"
+                print(f"[WARN] Gemini 호출 시간 초과: {e}")
+                time.sleep(_bounded_retry_delay_seconds(transport_attempt))
             except Exception as e:
                 last_failure_kind = "network_exception"
                 print(f"[WARN] Gemini 호출 예외: {e}")
                 time.sleep(_bounded_retry_delay_seconds(transport_attempt))
-        # PHASE 2 fallback은 1차 성공 모델이 quota·503으로 실제 응답하지 못한 경우에만 허용한다.
-        # 다른 형태의 실패는 PHASE 1→PHASE 2 모델 결속을 임의로 바꾸지 않고 보류한다.
+        # PHASE 2 fallback은 1차 성공 모델이 quota·503 또는 read timeout으로 실제 응답하지 못한 경우에만 허용한다.
+        # timeout도 현재 모델에서 transport attempt를 모두 소진한 뒤에만 뒤 순위 승인 모델로 전진한다.
+        # 그 밖의 네트워크 예외는 PHASE 1→PHASE 2 모델 결속을 임의로 바꾸지 않고 보류한다.
         if preferred_url and allow_preferred_fallback and candidate_index == 0:
-            if last_failure_kind not in ("quota_exhausted", "service_unavailable"):
+            if last_failure_kind not in ("quota_exhausted", "service_unavailable", "read_timeout"):
                 break
     failure_text = "AI 서버 일시적 과부하 또는 모델 접근 불가 상태입니다. 잠시 후 다시 시도해 주세요."
     failure_metadata = {"model_url": last_model_url, "response_model_version": "", "failed": True,
