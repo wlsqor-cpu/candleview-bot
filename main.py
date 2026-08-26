@@ -883,6 +883,9 @@ def build_phase2_evidence_slots(phase1_result, phase1_fact_registry):
         "pattern": value("1d", "단일/연속 캔들 패턴"),
         "volume_decay": value("1d", "거래량 배율 및 감속 추세"),
         "force": value("1d", "F1~F4 역학 코드"),
+        "fvg": value("1d", "가격 공백대"),
+        "order_block": value("1d", "세력 매물대"),
+        "overlap_zone": value("1d", "중첩 매물대"),
     }
     short_tf_zones = []
     for tf in ("4h", "1h"):
@@ -891,6 +894,7 @@ def build_phase2_evidence_slots(phase1_result, phase1_fact_registry):
             "structure_break": value(tf, "구조 돌파"),
             "fvg": value(tf, "가격 공백대"),
             "order_block": value(tf, "세력 매물대"),
+            "overlap_zone": value(tf, "중첩 매물대"),
             "volume_decay": value(tf, "거래량 배율 및 감속 추세"),
             "force": value(tf, "F1~F4 역학 코드"),
         }
@@ -915,16 +919,27 @@ def build_phase2_evidence_slots(phase1_result, phase1_fact_registry):
     elif "Open Interest" in text:
         open_interest_status = "PHASE1에 OI 데이터가 있음; 원문 값만 인용 가능"
 
+    support_walls = [line for line in whale_walls if line.startswith("매수벽")]
+    resistance_walls = [line for line in whale_walls if line.startswith("매도벽")]
+    data_quality_boundaries = {
+        "1w_divergence_status": value("1w", "다이버전스 / 추세 건전성"),
+        "1d_divergence_status": value("1d", "다이버전스 / 추세 건전성"),
+        "4h_divergence_status": value("4h", "다이버전스 / 추세 건전성"),
+        "1h_divergence_status": value("1h", "다이버전스 / 추세 건전성"),
+    }
     return {
-        "schema": "PHASE2_EVIDENCE_SLOTS_V1",
+        "schema": "PHASE2_EVIDENCE_SLOTS_V2",
         "role_reversal_references": structure_references,
         "daily_context": daily_context,
         "short_tf_zones": short_tf_zones,
         "plugin_context": {
             "whale_walls": whale_walls[:4],
+            "nearest_support_wall": support_walls[0] if support_walls else "",
+            "nearest_resistance_wall": resistance_walls[0] if resistance_walls else "",
             "volume_delta_status": volume_delta_status,
             "open_interest_status": open_interest_status,
         },
+        "data_quality_boundaries": data_quality_boundaries,
     }
 
 
@@ -2783,9 +2798,17 @@ def _is_unverified_decision_value_line(line):
     return bool(re.search(r"(확률|현재가|진입|목표|무효화|손절)", text) and re.search(r"\d", text))
 
 
+def _is_empty_probability_placeholder(line):
+    """Python 카드가 확률을 표시한 뒤 모델이 남긴 값 없는 placeholder만 제거한다."""
+    return bool(re.fullmatch(r"\s*(?:[➔•-]\s*)?\(확률\)\s*", str(line or "")))
+
+
 def _retain_route_context(body):
-    """핵심 결정 수치는 제거하고 FVG·Role Reversal 등 보조 설명은 그대로 유지한다."""
-    lines = [line for line in (body or "").splitlines() if not _is_unverified_decision_value_line(line)]
+    """핵심 결정 수치·빈 확률 placeholder만 제거하고 FVG·Role Reversal 등 보조 설명은 보존한다."""
+    lines = [
+        line for line in (body or "").splitlines()
+        if not _is_unverified_decision_value_line(line) and not _is_empty_probability_placeholder(line)
+    ]
     return "\n".join(lines).strip()
 
 
@@ -3160,10 +3183,11 @@ def run_phase2(phase1_result, symbol, exchange_name, phase1_canonical=None, phas
         f"반드시 JSON으로 응답하십시오. user_briefing에는 기존 1️⃣~6️⃣ 자연어 브리핑 전체를 충분한 문맥으로 작성하고, INTERNAL_EVIDENCE_LEDGER 표식은 넣지 마십시오. "
         f"다만 1️⃣의 메인·대체 시나리오 경로에서는 가격·확률 숫자를 직접 쓰지 말고, 각 라벨과 보조 레벨(FVG·Role Reversal·돌파선·다음 매물대)만 작성하십시오. "
         f"Python이 검증 완료된 ledger 값으로 진입·무효화·목표가·확률을 표시합니다. "
-        f"[필수 근거 슬롯 서술 계약] 문체와 문단 구성은 자연스럽게 작성하되, 위 슬롯의 role_reversal_references 중 실제 구조상태·돌파 값이 있는 항목을 대체 시나리오의 Role Reversal 라벨에 숫자 또는 범위로 한 번 명시하십시오. "
-        f"daily_context의 구조·패턴·거래량/감속·F코드는 1d 설명 또는 TF 상관관계에 한 문장으로 결속하십시오. short_tf_zones는 4h/1h 설명 또는 TF 상관관계에서 실제 FVG·세력 매물대 중 분석에 필요한 최대 두 구간만 TF 라벨과 함께 사용하십시오. "
-        f"plugin_context.whale_walls가 있으면 현재가 인접 매수·매도벽 중 최대 두 개만 조건부 수급 경계로 언급하십시오. Volume Delta·OI 상태가 ‘근거에 사용 금지’이면 결손/비적용 사실만 짧게 밝히고 방향·가격 근거로 사용하지 마십시오. "
-        f"슬롯의 값·TF·상태를 바꾸거나 없는 숫자를 보완하지 말고, 모든 슬롯을 기계적으로 나열하지도 마십시오. "
+        f"[필수 근거 슬롯 서술 계약] 문체와 문단 구성은 자연스럽게 작성하되, daily_context.overlap_zone이 실제 값이면 그 1d 구간을 대체 시나리오 Role Reversal에 TF 라벨과 함께 숫자 또는 범위로 한 번 명시하십시오. 값이 없을 때만 role_reversal_references의 실제 구조상태·돌파 값을 사용하십시오. "
+        f"daily_context의 구조·패턴·거래량/감속·F코드는 1d 설명 또는 TF 상관관계에 한 문장으로 결속하십시오. short_tf_zones는 4h/1h 설명 또는 TF 상관관계에서 실제 FVG·세력 매물대·중첩 매물대 중 분석에 필요한 최대 두 구간만 TF 라벨과 함께 사용하십시오. "
+        f"서로 다른 TF의 구간을 하나의 원천 구간처럼 합치거나, 1h F2·4h F3처럼 TF별 F코드를 다른 TF에 귀속하지 마십시오. 복수 TF 구간을 함께 말할 때는 ‘복합 지지/저항대’라고 하고 각 TF 값을 분리해 쓰십시오. "
+        f"plugin_context.nearest_support_wall과 nearest_resistance_wall이 모두 있으면 현재가 인접 매수·매도벽을 각각 한 번씩 조건부 수급 경계로 결속하십시오. Volume Delta·OI 상태가 ‘근거에 사용 금지’이면 5️⃣ 또는 6️⃣에 결손/비적용 사실만 한 문장으로 밝히고 방향·가격 근거로 사용하지 마십시오. "
+        f"data_quality_boundaries에 ‘데이터결손/판정불가’가 있으면 그 TF의 해당 지표만 판정불가라고 정확히 쓰고, TF 전체 데이터 결손으로 과장하지 마십시오. 슬롯의 값·TF·상태를 바꾸거나 없는 숫자를 보완하지 말고, 모든 슬롯을 기계적으로 나열하지도 마십시오. "
         f"'시스템 무결성 검증 완료', 'API Direct Data Parsing 완료', 'Layer 5-B 인라인 검증 100% 통과' 태그는 절대 작성하지 마십시오. "
         f"ledger에는 같은 결론의 검증용 원장과 기존 Final_신뢰도점수(0~5.9)를 final_confidence_score로 작성하십시오. ledger.bundles의 각 항목은 문자열이 아니라 "
         f"tf·window·fact·fact_ref·direction·role·axis 일곱 필드를 모두 가진 JSON 객체여야 합니다. "
