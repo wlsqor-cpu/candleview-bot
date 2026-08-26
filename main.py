@@ -2931,8 +2931,20 @@ def _load_phase2_ledger_repair_schema():
     return PHASE2_LEDGER_REPAIR_SCHEMA
 
 
+def split_phase2_provenance_warnings(warnings):
+    """내부 fact_ref 결속 관측과 카드 수학을 막는 구조 오류를 분리한다."""
+    provenance, blocking = [], []
+    for warning in warnings or []:
+        text = str(warning)
+        if "Source Bundle PHASE1 사실 참조 오류" in text:
+            provenance.append(text)
+        else:
+            blocking.append(text)
+    return blocking, provenance
+
+
 def render_phase2_structured_response(raw_json, phase1_fact_registry=None):
-    """JSON의 user_briefing은 보존하고 Bundle 사실은 PHASE 1 registry 값으로만 ledger에 기록한다."""
+    """JSON의 user_briefing을 보존하고, fact_ref 결속 오류는 비차단 provenance 관측으로 격리한다."""
     try:
         response = json.loads(raw_json)
         briefing = response["user_briefing"]
@@ -2958,19 +2970,24 @@ def render_phase2_structured_response(raw_json, phase1_fact_registry=None):
             f"축내상쇄: {ledger['nested_offset']}", f"진행국면: {ledger['regime']}",
             "Bundle:",
         ]
+        provenance_warnings = []
         for bundle in ledger["bundles"]:
             if not isinstance(bundle, dict):
                 raise ValueError("Source Bundle 객체 형식 오류")
             fact_ref = str(bundle["fact_ref"])
             source_fact = (phase1_fact_registry or {}).get(fact_ref)
             if not isinstance(source_fact, dict) or source_fact.get("tf") != str(bundle["tf"]):
-                raise ValueError(f"Source Bundle PHASE1 사실 참조 오류: {fact_ref}")
+                # 내부 식별자 표기만의 오류가 이미 유효한 점수·가격경로·확률 카드 전체를 차단하지 않게 한다.
+                provenance_warnings.append(f"Source Bundle PHASE1 사실 참조 오류: {fact_ref}")
+                source_value = "PHASE1 registry 결속 미확인"
+            else:
+                source_value = str(source_fact["value"])
             lines.append("- " + "|".join([
-                str(bundle["tf"]), str(bundle["window"]), str(source_fact["value"]), fact_ref,
+                str(bundle["tf"]), str(bundle["window"]), source_value, fact_ref,
                 str(bundle["direction"]), str(bundle["role"]), str(bundle["axis"]),
             ]))
         lines.append(LEDGER_END)
-        return briefing.strip() + "\n\n" + "\n".join(lines), []
+        return briefing.strip() + "\n\n" + "\n".join(lines), provenance_warnings
     except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
         return "", [f"PHASE2 구조화 JSON 파싱 실패: {exc}"]
 
@@ -3140,19 +3157,25 @@ def run_phase2(phase1_result, symbol, exchange_name, phase1_canonical=None, phas
             render_phase2_ledger_repair_response(raw_json, provisional_fallback_briefing, phase1_fact_registry)
             if is_lightweight_repair else render_phase2_structured_response(raw_json, phase1_fact_registry)
         )
-        if structured_warnings:
+        blocking_structured_warnings, provenance_warnings = split_phase2_provenance_warnings(structured_warnings)
+        if provenance_warnings:
+            observe(
+                "PROVENANCE_OBSERVED", attempt=attempt + 1, rule_ids=["P2V01"],
+                observation_codes=["FACT_REF_UNBOUND_NONBLOCKING"], provenance_warning_count=len(provenance_warnings),
+            )
+        if blocking_structured_warnings:
             # user_briefing이 있어도 ledger가 없거나 불완전하면, 이미 생성된 JSON만 재료로 한 번의 경량 repair를 먼저 시도한다.
             # 이 repair는 새 시장 판단을 만들지 않고 ledger·fact_ref 계약만 완성해 정상 결정값 카드를 복구한다.
             if not is_lightweight_repair:
-                last_rule_ids = classify_phase2_verification_warnings(structured_warnings, structured=True)
+                last_rule_ids = classify_phase2_verification_warnings(blocking_structured_warnings, structured=True)
                 observe(
                     "STRUCTURED_LEDGER_REPAIR_SCHEDULED", attempt=attempt + 1, rule_ids=last_rule_ids,
                     rule_subcodes=["P2S01"], has_user_briefing=bool(extract_phase2_briefing_fallback(raw_json)),
-                    structured_warning_codes=phase2_structured_warning_codes(structured_warnings),
+                    structured_warning_codes=phase2_structured_warning_codes(blocking_structured_warnings),
                 )
                 provisional_fallback_briefing = extract_phase2_briefing_fallback(raw_json)
                 lightweight_repair_prompt = build_phase2_lightweight_repair_prompt(
-                    raw_json, structured_warnings, fact_refs_for_prompt,
+                    raw_json, blocking_structured_warnings, fact_refs_for_prompt,
                     phase1_result=phase1_result, phase1_canonical=phase1_canonical,
                 )
                 continue
@@ -3163,19 +3186,19 @@ def run_phase2(phase1_result, symbol, exchange_name, phase1_canonical=None, phas
                     fallback_briefing,
                     None,
                     symbol.rsplit("/", 1)[-1] if "/" in symbol else "",
-                    all_validation_warnings=structured_warnings,
+                    all_validation_warnings=blocking_structured_warnings,
                     display_warnings=["구조화 ledger 복구 미완료"],
                 )
                 observe(
                     "STRUCTURED_LEDGER_OBSERVED", attempt=attempt + 1, rule_ids=["P2S01"],
                     observation_codes=["LEDGER_REPAIR_EXHAUSTED"] + sorted(set(fallback_display_warnings)),
-                    structured_warning_codes=phase2_structured_warning_codes(structured_warnings),
+                    structured_warning_codes=phase2_structured_warning_codes(blocking_structured_warnings),
                 )
                 observe("PUBLISHED", attempt=attempt + 1)
                 return fallback_display
-            last_rule_ids = classify_phase2_verification_warnings(structured_warnings, structured=True)
+            last_rule_ids = classify_phase2_verification_warnings(blocking_structured_warnings, structured=True)
             observe("STRUCTURED_BRIEFING_HELD", attempt=attempt + 1, rule_ids=last_rule_ids, rule_subcodes=["P2S01"])
-            last_verified = "[검증보류 — 사용자 브리핑 및 구조화 ledger 누락]\n" + "\n".join(f"• {warning}" for warning in structured_warnings)
+            last_verified = "[검증보류 — 사용자 브리핑 및 구조화 ledger 누락]\n" + "\n".join(f"• {warning}" for warning in blocking_structured_warnings)
             break
 
         normalized_result, normalization_meta = normalize_evidence_ledger_for_publication(raw_result)
@@ -3205,7 +3228,7 @@ def run_phase2(phase1_result, symbol, exchange_name, phase1_canonical=None, phas
             clean_briefing,
             display_contract,
             symbol.rsplit("/", 1)[-1] if "/" in symbol else "",
-            all_validation_warnings=validation_warnings,
+            all_validation_warnings=list(validation_warnings) + list(provenance_warnings),
             display_warnings=display_warnings,
         )
         if display_warnings:
