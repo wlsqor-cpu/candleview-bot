@@ -859,6 +859,75 @@ def build_phase1_fact_registry(phase1_result):
     return registry
 
 
+def build_phase2_evidence_slots(phase1_result, phase1_fact_registry):
+    """PHASE 1 사실만으로 최종 브리핑의 누락 방지 근거 슬롯을 만든다.
+
+    이 함수는 점수·방향·가격을 계산하거나 새 시장 데이터를 만들지 않는다. 모델이 PHASE 1에
+    이미 표시된 구조·구간·보조지표 상태를 자연어에 빠뜨리지 않도록 작은 선택 목록만 제공한다.
+    """
+    registry = phase1_fact_registry or {}
+    timeframes = ("1w", "1d", "4h", "1h")
+
+    def value(tf, label):
+        item = registry.get(f"{tf}:{label}")
+        return str(item.get("value", "")).strip() if isinstance(item, dict) else ""
+
+    structure_references = [
+        {"tf": tf, "structure_state": value(tf, "구조 상태"), "structure_break": value(tf, "구조 돌파")}
+        for tf in timeframes
+        if value(tf, "구조 상태") or value(tf, "구조 돌파")
+    ]
+    daily_context = {
+        "structure_state": value("1d", "구조 상태"),
+        "structure_break": value("1d", "구조 돌파"),
+        "pattern": value("1d", "단일/연속 캔들 패턴"),
+        "volume_decay": value("1d", "거래량 배율 및 감속 추세"),
+        "force": value("1d", "F1~F4 역학 코드"),
+    }
+    short_tf_zones = []
+    for tf in ("4h", "1h"):
+        item = {
+            "tf": tf,
+            "structure_break": value(tf, "구조 돌파"),
+            "fvg": value(tf, "가격 공백대"),
+            "order_block": value(tf, "세력 매물대"),
+            "volume_decay": value(tf, "거래량 배율 및 감속 추세"),
+            "force": value(tf, "F1~F4 역학 코드"),
+        }
+        if any(item[key] for key in ("structure_break", "fvg", "order_block", "volume_decay", "force")):
+            short_tf_zones.append(item)
+
+    text = str(phase1_result or "")
+    whale_walls = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if re.match(r"^(매수벽|매도벽)\s+[-+]?\d", stripped) and "R_wall=" in stripped:
+            whale_walls.append(stripped[:280])
+    volume_delta_status = ""
+    if "Volume Delta" in text:
+        if "거래소 미지원 또는 데이터결손" in text or "Volume Delta 수집 불가" in text:
+            volume_delta_status = "PHASE1 표기상 거래소 미지원 또는 데이터결손; 방향·가격 근거에 사용 금지"
+        else:
+            volume_delta_status = "PHASE1에 Volume Delta 데이터가 있음; 원문에 있는 TF 값만 인용 가능"
+    open_interest_status = ""
+    if "현물마켓 자체 OI 없음" in text or "[해당없음/기능정지]" in text:
+        open_interest_status = "현물 OI 해당없음 또는 기능정지; 방향·가격 근거에 사용 금지"
+    elif "Open Interest" in text:
+        open_interest_status = "PHASE1에 OI 데이터가 있음; 원문 값만 인용 가능"
+
+    return {
+        "schema": "PHASE2_EVIDENCE_SLOTS_V1",
+        "role_reversal_references": structure_references,
+        "daily_context": daily_context,
+        "short_tf_zones": short_tf_zones,
+        "plugin_context": {
+            "whale_walls": whale_walls[:4],
+            "volume_delta_status": volume_delta_status,
+            "open_interest_status": open_interest_status,
+        },
+    }
+
+
 def validate_phase1_fact_registry(registry):
     if not isinstance(registry, dict) or not registry:
         return ["PHASE1 사실 registry 누락"]
@@ -3078,6 +3147,7 @@ def run_phase2(phase1_result, symbol, exchange_name, phase1_canonical=None, phas
     phase1_fact_registry = build_phase1_fact_registry(phase1_result)
     fact_registry_warnings = validate_phase1_fact_registry(phase1_fact_registry)
     fact_refs_for_prompt = sorted(phase1_fact_registry)
+    phase2_evidence_slots = build_phase2_evidence_slots(phase1_result, phase1_fact_registry)
 
     base_prompt = (
         f"{CANDLEVIEW_PROMPT_PHASE2}\n\n"
@@ -3085,10 +3155,15 @@ def run_phase2(phase1_result, symbol, exchange_name, phase1_canonical=None, phas
         f"[PHASE 1 canonical provenance]\n{json.dumps(phase1_canonical['provenance'], ensure_ascii=False, sort_keys=True)}\n\n"
         f"[PHASE 1 완성 결과]\n{phase1_result}\n\n"
         f"[PHASE 1 사실 참조 목록]\n{json.dumps(fact_refs_for_prompt, ensure_ascii=False)}\n\n"
+        f"[PHASE 2 필수 근거 슬롯 — PHASE 1에서 결정론적으로 추출됨]\n{json.dumps(phase2_evidence_slots, ensure_ascii=False, sort_keys=True)}\n\n"
         f"이제 PHASE 2 통합 브리핑을 엔진 규칙에 따라 완제 출력하십시오. 새로운 수치나 판단을 임의로 추가하지 말고, PHASE 1에서 도출된 데이터만을 근거로 사용하십시오.\n"
         f"반드시 JSON으로 응답하십시오. user_briefing에는 기존 1️⃣~6️⃣ 자연어 브리핑 전체를 충분한 문맥으로 작성하고, INTERNAL_EVIDENCE_LEDGER 표식은 넣지 마십시오. "
         f"다만 1️⃣의 메인·대체 시나리오 경로에서는 가격·확률 숫자를 직접 쓰지 말고, 각 라벨과 보조 레벨(FVG·Role Reversal·돌파선·다음 매물대)만 작성하십시오. "
         f"Python이 검증 완료된 ledger 값으로 진입·무효화·목표가·확률을 표시합니다. "
+        f"[필수 근거 슬롯 서술 계약] 문체와 문단 구성은 자연스럽게 작성하되, 위 슬롯의 role_reversal_references 중 실제 구조상태·돌파 값이 있는 항목을 대체 시나리오의 Role Reversal 라벨에 숫자 또는 범위로 한 번 명시하십시오. "
+        f"daily_context의 구조·패턴·거래량/감속·F코드는 1d 설명 또는 TF 상관관계에 한 문장으로 결속하십시오. short_tf_zones는 4h/1h 설명 또는 TF 상관관계에서 실제 FVG·세력 매물대 중 분석에 필요한 최대 두 구간만 TF 라벨과 함께 사용하십시오. "
+        f"plugin_context.whale_walls가 있으면 현재가 인접 매수·매도벽 중 최대 두 개만 조건부 수급 경계로 언급하십시오. Volume Delta·OI 상태가 ‘근거에 사용 금지’이면 결손/비적용 사실만 짧게 밝히고 방향·가격 근거로 사용하지 마십시오. "
+        f"슬롯의 값·TF·상태를 바꾸거나 없는 숫자를 보완하지 말고, 모든 슬롯을 기계적으로 나열하지도 마십시오. "
         f"'시스템 무결성 검증 완료', 'API Direct Data Parsing 완료', 'Layer 5-B 인라인 검증 100% 통과' 태그는 절대 작성하지 마십시오. "
         f"ledger에는 같은 결론의 검증용 원장과 기존 Final_신뢰도점수(0~5.9)를 final_confidence_score로 작성하십시오. ledger.bundles의 각 항목은 문자열이 아니라 "
         f"tf·window·fact·fact_ref·direction·role·axis 일곱 필드를 모두 가진 JSON 객체여야 합니다. "
