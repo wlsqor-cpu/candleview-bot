@@ -1604,7 +1604,8 @@ def _bounded_retry_delay_seconds(attempt_index, retry_after_seconds=None, jitter
 
 def call_gemini_api_with_retry(full_prompt, max_tokens=16384, preferred_url=None, return_metadata=False,
                                response_json_schema=None, allow_preferred_fallback=False,
-                               allow_short_quota_retry=False):
+                               allow_short_quota_retry=False, request_timeout_seconds=120,
+                               max_transport_attempts=2):
     headers = {
         "Content-Type": "application/json",
         "X-goog-api-key": GEMINI_API_KEY,
@@ -1644,6 +1645,15 @@ def call_gemini_api_with_retry(full_prompt, max_tokens=16384, preferred_url=None
         failure_metadata = {"model_url": "", "response_model_version": "", "failed": True, "failure_kind": "model_selection"}
         return (failure_text, failure_metadata) if return_metadata else failure_text
 
+    try:
+        request_timeout_seconds = max(5, int(request_timeout_seconds))
+    except (TypeError, ValueError):
+        request_timeout_seconds = 120
+    try:
+        max_transport_attempts = max(1, int(max_transport_attempts))
+    except (TypeError, ValueError):
+        max_transport_attempts = 2
+
     last_failure_kind = "model_call"
     last_retry_after_seconds = None
     last_model_url = ""
@@ -1651,9 +1661,9 @@ def call_gemini_api_with_retry(full_prompt, max_tokens=16384, preferred_url=None
     for candidate_index, candidate in enumerate(candidates):
         url = candidate["model_url"]
         last_model_url = url
-        for transport_attempt in range(2):
+        for transport_attempt in range(max_transport_attempts):
             try:
-                res = requests.post(url, headers=headers, json=payload, timeout=120)
+                res = requests.post(url, headers=headers, json=payload, timeout=request_timeout_seconds)
                 if res.status_code == 200:
                     data = res.json()
                     parts = data["candidates"][0]["content"]["parts"]
@@ -2091,6 +2101,9 @@ def run_phase1(symbol_input, exchange_name, custom_tfs):
         phase1_result, phase1_model_meta = call_gemini_api_with_retry(
             phase1_prompt, max_tokens=12000, return_metadata=True,
             allow_short_quota_retry=True,
+            # PHASE 1 read timeout은 같은 대형 요청을 같은 모델에 120초씩 반복하지 않는다.
+            # 60초 무응답이면 승인 roster의 다음 모델로 즉시 순방향 fallback해 전체 명령의 장기 무응답을 막는다.
+            request_timeout_seconds=60, max_transport_attempts=1,
         )
         supplement = {
             "delta_list": tf_delta_list,
