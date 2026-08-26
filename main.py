@@ -2836,9 +2836,21 @@ def _retain_route_context(body):
     return "\n".join(lines).strip()
 
 
-def _render_path_section(match, card):
+def _scenario_direction_labels(direction):
+    """검증된 ledger 방향을 메인·대체 경로 제목에만 표시한다."""
+    if direction == "상방":
+        return "상방", "하방"
+    if direction == "하방":
+        return "하방", "상방"
+    return "횡보", "상·하방"
+
+
+def _render_path_section(match, card, direction_label=None):
     context = _retain_route_context(match.group("body"))
-    return match.group("header") + "\n" + card + ("\n" + context if context else "") + "\n\n"
+    header = match.group("header").rstrip()
+    if direction_label:
+        header += f" [{direction_label}]"
+    return header + "\n" + card + ("\n" + context if context else "") + "\n\n"
 
 
 def _redact_unverified_decision_lines(text):
@@ -2908,8 +2920,9 @@ def render_verified_phase2_decision_blocks(text, contract, quote, all_validation
         main_card = "(결정값 검증보류 — 가격경로 확인 필요)"
         alt_card = "(결정값 검증보류 — 가격경로 확인 필요)"
 
-    rendered = re.sub(MAIN_PATH_SECTION_PATTERN, lambda match: _render_path_section(match, main_card), rendered, count=1)
-    rendered = re.sub(ALT_PATH_SECTION_PATTERN, lambda match: _render_path_section(match, alt_card), rendered, count=1)
+    main_direction, alt_direction = _scenario_direction_labels(contract.get("direction") if contract else "횡보")
+    rendered = re.sub(MAIN_PATH_SECTION_PATTERN, lambda match: _render_path_section(match, main_card, main_direction), rendered, count=1)
+    rendered = re.sub(ALT_PATH_SECTION_PATTERN, lambda match: _render_path_section(match, alt_card, alt_direction), rendered, count=1)
     if not all_validation_warnings and not display_warnings:
         rendered = rendered.rstrip() + "\n\n시스템 무결성 검증 완료\n■ API Direct Data Parsing 완료\n■ Layer 5-B 인라인 검증 100% 통과"
     return rendered.rstrip(), display_warnings
