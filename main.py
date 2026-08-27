@@ -919,6 +919,90 @@ def build_phase1_fact_registry(phase1_result):
     return registry
 
 
+ORIGIN_FACT_STATE_LABELS = ("현재가", "현재 진행 봉", "구조 돌파")
+
+
+def _format_origin_fact_number(value):
+    """원천 OHLCV 숫자를 가격결정에 관여하지 않는 표시용 문자열로만 안정화한다."""
+    try:
+        number = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return ""
+    if not number.is_finite():
+        return ""
+    rendered = format(number.normalize(), "f")
+    return "0" if rendered in ("", "-0") else rendered
+
+
+def build_phase1_origin_fact_registry(origin_tf_states, quote):
+    """PHASE 1 모델 표시문과 독립된 원천 current-state fact registry를 만든다.
+
+    이 registry는 수집 loop에서 이미 받은 current OHLCV와 data quality만 사용한다.
+    점수·방향·FVG/OB·가격경로·완성봉 BOS 판단을 새로 만들지 않는다.
+    """
+    registry = {}
+    currency = str(quote or "").upper()
+    if not currency:
+        return registry
+    for tf, state in (origin_tf_states or {}).items():
+        if tf not in TF_STANDARD_MINUTES or not isinstance(state, dict):
+            continue
+        if state.get("quality_status") == "데이터결손/판정불가":
+            continue
+        current_price = _format_origin_fact_number(state.get("current_price"))
+        candle = state.get("current_candle") if isinstance(state.get("current_candle"), dict) else {}
+        high = _format_origin_fact_number(candle.get("high"))
+        low = _format_origin_fact_number(candle.get("low"))
+        midpoint = _format_origin_fact_number(candle.get("midpoint"))
+
+        def add(label, value):
+            if not value:
+                return
+            fact_ref = f"{tf}:{label}"
+            registry[fact_ref] = {
+                "fact_ref": fact_ref,
+                "tf": tf,
+                "label": label,
+                "value": value,
+                "source": "stage0_origin_current_ohlcv",
+            }
+
+        add("현재가", f"{current_price} {currency}" if current_price else "")
+        if high and low and midpoint:
+            add("현재 진행 봉", f"고가 {high} {currency} / 저가 {low} {currency} / 중심가 {midpoint} {currency}")
+        # 진행봉의 미확정성만 원천에서 확정한다. 직전 완성봉 BOS/CHoCH 여부는 기존 PHASE 1 사실에 맡긴다.
+        if high and low:
+            add("구조 돌파", "진행봉 — 구조 돌파 여부 미확정 (현재 진행봉은 확정 판단에 사용하지 않음)")
+    return registry
+
+
+def merge_phase1_fact_registries(display_registry, origin_registry):
+    """표시형 PHASE 1 사실과 Stage 0 origin current-state를 canonical TF key로 병합한다.
+
+    현재가·현재 진행 봉은 origin을 우선해 Markdown/제목 변형으로 인한 유실을 막는다.
+    구조 돌파는 표시형의 직전 완성봉 확정 정보를 우선하고, 표시형이 없을 때만 origin의 진행봉 미확정 경계를 쓴다.
+    """
+    merged = {}
+    for fact_ref, item in (display_registry or {}).items():
+        if not isinstance(item, dict) or item.get("fact_ref") != fact_ref:
+            continue
+        if item.get("tf") not in TF_STANDARD_MINUTES or item.get("label") not in PHASE1_FACT_LABELS:
+            continue
+        if str(item.get("value") or "").strip():
+            merged[fact_ref] = dict(item)
+    for fact_ref, item in (origin_registry or {}).items():
+        if not isinstance(item, dict) or item.get("fact_ref") != fact_ref:
+            continue
+        tf, label = item.get("tf"), item.get("label")
+        value = str(item.get("value") or "").strip()
+        if tf not in TF_STANDARD_MINUTES or label not in ORIGIN_FACT_STATE_LABELS or not value:
+            continue
+        # Origin current state is the source of truth. Existing display structure includes richer completed-bar facts.
+        if label in ("현재가", "현재 진행 봉") or fact_ref not in merged:
+            merged[fact_ref] = dict(item)
+    return merged
+
+
 def build_phase2_evidence_slots(phase1_result, phase1_fact_registry):
     """PHASE 1 사실만으로 모든 실제 수집 TF의 브리핑 누락 방지 슬롯을 만든다.
 
@@ -1046,7 +1130,7 @@ def validate_phase1_canonical(canonical):
 PHASE2_INPUT_PROVENANCE_SCHEMA = "PHASE2_INPUT_PROVENANCE_V2"
 
 
-def build_phase2_input_provenance(phase1_result, phase1_canonical):
+def build_phase2_input_provenance(phase1_result, phase1_canonical, phase1_fact_registry=None):
     """PHASE 2가 참조하는 PHASE 1 결과·원천 관측의 비식별 immutable fingerprint를 만든다."""
     canonical = phase1_canonical or {}
     provenance = canonical.get("provenance", {}) if isinstance(canonical, dict) else {}
@@ -1056,7 +1140,7 @@ def build_phase2_input_provenance(phase1_result, phase1_canonical):
     for item in tf_quality if isinstance(tf_quality, list) else []:
         if isinstance(item, dict):
             quality_summary.append({"tf": str(item.get("tf", "")), "status": str(item.get("status", ""))})
-    fact_registry = build_phase1_fact_registry(phase1_result)
+    fact_registry = phase1_fact_registry if isinstance(phase1_fact_registry, dict) else build_phase1_fact_registry(phase1_result)
     fact_registry_json = json.dumps(fact_registry, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return {
         "schema_version": PHASE2_INPUT_PROVENANCE_SCHEMA,
@@ -1073,9 +1157,9 @@ def build_phase2_input_provenance(phase1_result, phase1_canonical):
     }
 
 
-def validate_phase2_input_provenance(record, phase1_result, phase1_canonical):
+def validate_phase2_input_provenance(record, phase1_result, phase1_canonical, phase1_fact_registry=None):
     """저장된 provenance가 현재 PHASE 1 결과·canonical과 정확히 같은지 확인한다."""
-    expected = build_phase2_input_provenance(phase1_result, phase1_canonical)
+    expected = build_phase2_input_provenance(phase1_result, phase1_canonical, phase1_fact_registry)
     if not isinstance(record, dict):
         return ["P2I01 입력 provenance 누락"]
     if set(record) != set(expected):
@@ -2085,6 +2169,8 @@ def run_phase1(symbol_input, exchange_name, custom_tfs):
         last_close = None
         tf_delta_list = []
         tf_quality_list = []
+        # PHASE 1 모델 표시 형식과 무관하게 같은 수집 세션의 current-state를 보존한다.
+        origin_tf_states = {}
         snapshot_events = []
         # TF 루프: OHLCV+RSI + TF별 Volume Delta(Plugin7, V003은 TF마다 다른 값을 요구)
         # 한 TF의 수집 예외는 그 TF의 데이터결손으로만 국소화한다. 다른 정상 TF의 PHASE 1/2 경로는 계속 유지한다.
@@ -2130,6 +2216,7 @@ def run_phase1(symbol_input, exchange_name, custom_tfs):
             # 실제 원천 무결성 결손은 OHLCV 및 그 파생값을 분석 입력에서 제외한다.
             # 가용 이력 부족(가용봉 분석)은 이 분기에 들어오지 않으며 전체 봉을 그대로 사용한다.
             if quality["status"] == "데이터결손/판정불가":
+                origin_tf_states[tf] = {"quality_status": quality["status"]}
                 payload += f"[{tf} 분석 입력 제외] 원천 무결성 결손으로 OHLCV·RSI·캔들·다이버전스·구조 데이터를 사용하지 않습니다.\n"
                 tf_delta_info = fetch_volume_delta_summary(exchange_class, symbol, tf, limit=120)
                 tf_delta_list.append({"tf": tf, "info": tf_delta_info})
@@ -2153,7 +2240,19 @@ def run_phase1(symbol_input, exchange_name, custom_tfs):
             # 인 경우는 직전봉이 실제로 없는 정상 상황이므로 그대로 둔다.
             df_offset = len(df) - len(recent)
             if len(recent) > 0:
-                last_close = float(recent.iloc[-1]["close"])
+                current_row = recent.iloc[-1]
+                last_close = float(current_row["close"])
+                origin_tf_states[tf] = {
+                    "quality_status": quality["status"],
+                    "current_price": current_row["close"],
+                    "current_candle": {
+                        "high": current_row["high"],
+                        "low": current_row["low"],
+                        "midpoint": (current_row["high"] + current_row["low"]) / 2,
+                    },
+                }
+            else:
+                origin_tf_states[tf] = {"quality_status": quality["status"]}
 
             payload += f"\n[{tf} 타임프레임 API 수신 배열 (최근 {len(recent)}봉)]\n"
             n_rows = len(recent)
@@ -2302,12 +2401,17 @@ def run_phase1(symbol_input, exchange_name, custom_tfs):
             )
         if canonical_warnings:
             phase1_result += "\n\n[자동검증 로그 — Python 사후검증]\n" + "\n".join(f"• {w}" for w in canonical_warnings)
-        # PHASE 1 최종 표시본에서 compact 사실 registry를 만들고 immutable fingerprint를 만든다.
-        # registry는 새 분석이 아니라 이미 표시된 TF별 사실의 참조 목록이며, PHASE 2 Bundle의 출처 검증에만 사용한다.
-        supplement["phase1_fact_registry"] = build_phase1_fact_registry(phase1_result)
+        # PHASE 1 표시 registry는 provenance fallback으로 유지하고, current-state는 같은 수집 loop의 origin registry를 우선한다.
+        # 두 registry 모두 PHASE 1 세션에서 이미 보존된 사실이며 새 수집·새 시장 판단을 만들지 않는다.
+        display_fact_registry = build_phase1_fact_registry(phase1_result)
+        origin_fact_registry = build_phase1_origin_fact_registry(origin_tf_states, quote)
+        supplement["phase1_origin_fact_registry"] = origin_fact_registry
+        supplement["phase1_fact_registry"] = merge_phase1_fact_registries(display_fact_registry, origin_fact_registry)
         supplement["phase1_fact_registry_warnings"] = validate_phase1_fact_registry(supplement["phase1_fact_registry"])
         # 이 값은 원천·카드가 이후 바뀌었을 때 PHASE 2 실행을 차단하는 용도이며, 모델 입력을 축약·변형하지 않는다.
-        supplement["phase2_input_provenance"] = build_phase2_input_provenance(phase1_result, phase1_canonical)
+        supplement["phase2_input_provenance"] = build_phase2_input_provenance(
+            phase1_result, phase1_canonical, supplement["phase1_fact_registry"]
+        )
         return phase1_result, symbol, ex_name.upper(), supplement
 
     except Exception as e:
@@ -3135,6 +3239,48 @@ def _ensure_phase2_integration_boundary(text, phase1_fact_registry):
     return PHASE2_INTEGRATION_SECTION_PATTERN.sub(replace, str(text or "")), observations
 
 
+def _normalize_phase2_integration_structure_claims(text, phase1_fact_registry):
+    """5️⃣에서 확정·미확정 구조 돌파를 같은 확정 근거로 묶지 않게 한다.
+
+    PHASE 1에 `미확정`만 있는 TF는 확정 돌파로 승격하지 않는다. 직전 완성봉 BOS/CHoCH가
+    명시된 TF는 그 제한된 사실만 남긴다. 이 함수는 방향·가격·점수를 새로 판단하지 않는다.
+    """
+    observations = []
+    pattern = re.compile(
+        r"(?P<prefix>(?:하위\s*(?:타임프레임|TF)\s*)?\()"
+        r"(?P<tfs>[^)]*)"
+        r"(?P<suffix>\)\s*의\s*구조(?:적)?\s*돌파가\s*[^.\n]*\.)"
+    )
+
+    def replace(match):
+        listed_tfs = []
+        for raw_tf in re.findall(r"\d+[mhdwM]", match.group("tfs")):
+            if raw_tf in TF_STANDARD_MINUTES and raw_tf not in listed_tfs:
+                listed_tfs.append(raw_tf)
+        states = []
+        for tf in listed_tfs:
+            structure_break = _phase1_fact_value(tf, "구조 돌파", phase1_fact_registry)
+            pending = bool(re.search(r"(미확정|보류|대기)", structure_break))
+            confirmed = bool(re.search(r"(?:BOS|CHoCH).*확정|확정.*(?:BOS|CHoCH)", structure_break))
+            states.append((tf, pending, confirmed))
+        if not states or not any(pending for _, pending, _ in states):
+            return match.group(0)
+        clauses = []
+        for tf, pending, confirmed in states:
+            if confirmed and pending:
+                clauses.append(f"{tf}의 직전 완성봉 구조 돌파 확인 및 진행봉 미확정")
+            elif confirmed:
+                clauses.append(f"{tf}의 직전 완성봉 구조 돌파 확인")
+            elif pending:
+                clauses.append(f"{tf}의 진행봉 구조 돌파 미확정")
+            else:
+                clauses.append(f"{tf}의 구조 돌파 상태")
+        observations.append("INTEGRATION_STRUCTURE_CONFIRMATION_NORMALIZED:" + ",".join(tf for tf, _, _ in states))
+        return "하위 타임프레임에서 " + " / ".join(clauses) + " 상태가 공존합니다."
+
+    return pattern.sub(replace, str(text or "")), observations
+
+
 def ensure_phase2_tf_narrative_completeness(text, phase1_fact_registry):
     """제목·방향만 남은 TF와 진행봉·미확정 경계 누락 TF에만 PHASE 1 사실 행을 보완한다."""
     source = str(text or "")
@@ -3162,8 +3308,9 @@ def ensure_phase2_tf_narrative_completeness(text, phase1_fact_registry):
         return match.group("heading") + rendered_body
 
     rendered = TF_ANALYSIS_HEADING_PATTERN.sub(replace, source)
+    rendered, structure_observations = _normalize_phase2_integration_structure_claims(rendered, phase1_fact_registry)
     rendered, integration_observations = _ensure_phase2_integration_boundary(rendered, phase1_fact_registry)
-    return rendered, backfill_observations + integration_observations
+    return rendered, backfill_observations + structure_observations + integration_observations
 
 
 def phase2_briefing_completeness_observations(text):
@@ -3418,7 +3565,7 @@ def extract_phase2_briefing_fallback(raw_json):
 # ============================================================
 def run_phase2(phase1_result, symbol, exchange_name, phase1_canonical=None, phase1_model=None,
                phase2_input_provenance=None, session_id=None, session_execution_ordinal=1,
-               trigger_action="phase2_run", phase2_execution_metadata=None):
+               trigger_action="phase2_run", phase2_execution_metadata=None, phase1_fact_registry=None):
     """PHASE 2 실행. attempt는 내부 재질의 순번, execution ordinal은 세션 실행 순번이다."""
     try:
         session_execution_ordinal = int(session_execution_ordinal)
@@ -3441,7 +3588,9 @@ def run_phase2(phase1_result, symbol, exchange_name, phase1_canonical=None, phas
             "가격·방향·확률·목표가는 제공되지 않습니다. 다시 분석을 실행해 주세요."
         )
     canonical_warnings = validate_phase1_canonical(phase1_canonical) if phase1_canonical else ["PHASE1 canonical 누락"]
-    input_warnings = validate_phase2_input_provenance(phase2_input_provenance, phase1_result, phase1_canonical)
+    input_warnings = validate_phase2_input_provenance(
+        phase2_input_provenance, phase1_result, phase1_canonical, phase1_fact_registry
+    )
     model_url = (phase1_model or {}).get("model_url")
     repair_model_url = model_url
     precheck_warnings = list(canonical_warnings) + list(input_warnings)
@@ -3452,8 +3601,24 @@ def run_phase2(phase1_result, symbol, exchange_name, phase1_canonical=None, phas
         observe("PRECHECK_HELD", rule_ids=rule_ids)
         return "[검증보류 — PHASE 2 실행 차단]\n" + "\n".join(f"• {w}" for w in precheck_warnings)
 
-    phase1_fact_registry = build_phase1_fact_registry(phase1_result)
+    # 승인 세션의 병합 registry가 있으면 사용한다. 직접 호출/구세션은 표시형 parser로만 fallback한다.
+    display_fact_registry = build_phase1_fact_registry(phase1_result)
+    if isinstance(phase1_fact_registry, dict):
+        phase1_fact_registry = phase1_fact_registry
+        registry_source = "session_origin_merged"
+    else:
+        phase1_fact_registry = display_fact_registry
+        registry_source = "display_parser_fallback"
     fact_registry_warnings = validate_phase1_fact_registry(phase1_fact_registry)
+    origin_fact_count = sum(
+        1 for item in phase1_fact_registry.values()
+        if isinstance(item, dict) and item.get("source") == "stage0_origin_current_ohlcv"
+    )
+    observe(
+        "FACT_REGISTRY_BOUND", rule_ids=["P2D02"], registry_source=registry_source,
+        fact_registry_count=len(phase1_fact_registry), origin_fact_count=origin_fact_count,
+        display_fact_count=len(display_fact_registry),
+    )
     fact_refs_for_prompt = sorted(phase1_fact_registry)
     phase2_evidence_slots = build_phase2_evidence_slots(phase1_result, phase1_fact_registry)
 
@@ -4547,6 +4712,7 @@ while True:
                             1 + int(cached.get("phase2_retry_count", 0) or 0),
                             action,
                             phase2_execution_metadata=phase2_meta,
+                            phase1_fact_registry=(cached.get("supplement") or {}).get("phase1_fact_registry"),
                         )
                     except Exception:
                         # 예외는 기존 상위 실패 격리로 전달하되, 세션을 in_progress에 남기지 않는다.
