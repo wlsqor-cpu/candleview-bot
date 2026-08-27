@@ -2877,39 +2877,39 @@ ALT_PATH_SECTION_PATTERN = (
 )
 
 
-def _is_unverified_decision_value_line(line):
-    """핵심 결정값 키워드와 수치가 함께 있는 행만 제거해 일반 설명 문장은 보존한다."""
+def _classify_route_context_line(line):
+    """경로 행을 한 번만 분류한다: 검증 전 결정값, 미채움 template, 값 있는 보조 근거."""
     text = str(line or "")
-    return bool(re.search(r"(확률|현재가|진입|목표|무효화|손절)", text) and re.search(r"\d", text))
-
-
-def _is_empty_probability_placeholder(line):
-    """Python 카드가 확률을 표시한 뒤 모델이 남긴 숫자 없는 placeholder만 제거한다."""
-    text = str(line or "")
-    return bool(re.fullmatch(
-        r"\s*(?:[➔•-]\s*)?\(확률\s*%?(?:\s*(?:—|--|-)\s*참고용,\s*백테스트\s*검증치\s*아님)?\s*\)",
+    if re.search(r"(확률|현재가|진입|목표|무효화|손절)", text) and re.search(r"\d", text):
+        return "drop_unverified_decision"
+    if re.fullmatch(
+        r"\s*(?:[➔•-]\s*)?\(확률\s*(?:(?:\(\s*수치\s*\)\s*%?)|%)?"
+        r"\s*(?:(?:—|--|-)\s*참고용,\s*백테스트\s*검증치\s*아님)?\s*\)",
         text,
-    ))
+    ):
+        return "drop_empty_template"
+    if re.fullmatch(
+        r"\s*(?:[➔•-]\s*)?(?:현재가|1차\s*근거리\s*지지/저항\s*\(=\s*진입\s*예상가\)|"
+        r"비어있는\s*매물\s*공백대\s*\[FVG\]|주요\s*돌파선|1차\s*목표가|2차\s*목표가|"
+        r"지지·저항\s*역할\s*전환선\s*\[Role Reversal\]|무효화\s*손절선|다음\s*매물대)"
+        r"(?:\s*\(\s*수치\s*\))?\s*(?:이탈)?\s*",
+        text,
+    ):
+        return "drop_empty_template"
+    return "keep_auxiliary_context"
 
 
-def _is_empty_route_context_label(line):
-    """값·TF·조건이 전혀 없는 경로 라벨은 보조 근거가 아니므로 빈 행으로 발행하지 않는다."""
-    return bool(re.fullmatch(
-        r"\s*(?:[➔•-]\s*)?(?:현재가|비어있는\s*매물\s*공백대\s*\[FVG\]|주요\s*돌파선|"
-        r"지지·저항\s*역할\s*전환선\s*\[Role Reversal\]|무효화\s*손절선\s*이탈|다음\s*매물대)\s*",
-        str(line or ""),
-    ))
-
-
-def _retain_route_context(body):
-    """검증되지 않은 결정값·빈 확률·값 없는 보조 라벨만 제거하고 실제 FVG·Role Reversal 근거는 보존한다."""
-    lines = [
-        line for line in (body or "").splitlines()
-        if not _is_unverified_decision_value_line(line)
-        and not _is_empty_probability_placeholder(line)
-        and not _is_empty_route_context_label(line)
-    ]
-    return "\n".join(lines).strip()
+def _retain_route_context(body, return_metadata=False):
+    """단일 분류기로 실제 보조 근거만 보존하고, 미채움 template 제거 여부를 관측한다."""
+    retained, removed_kinds = [], set()
+    for line in (body or "").splitlines():
+        classification = _classify_route_context_line(line)
+        if classification == "keep_auxiliary_context":
+            retained.append(line)
+        else:
+            removed_kinds.add(classification)
+    cleaned = "\n".join(retained).strip()
+    return (cleaned, removed_kinds) if return_metadata else cleaned
 
 
 def _scenario_direction_labels(direction):
@@ -2930,8 +2930,11 @@ def _render_path_section(match, card, direction_label=None):
 
 
 def _redact_unverified_decision_lines(text):
-    """필수 경로 섹션이 없을 때도 검증되지 않은 핵심 가격·확률 라인을 직접 표시하지 않는다."""
-    lines = [line for line in (text or "").splitlines() if not _is_unverified_decision_value_line(line)]
+    """필수 경로 섹션이 없어도 단일 분류기로 미검증 결정값·미채움 template를 제거한다."""
+    lines = [
+        line for line in (text or "").splitlines()
+        if _classify_route_context_line(line) == "keep_auxiliary_context"
+    ]
     return "\n".join(lines).rstrip()
 
 
@@ -2968,6 +2971,11 @@ def render_verified_phase2_decision_blocks(text, contract, quote, all_validation
         display_warnings.append("비경로 확률 표기 제거")
     main_match = re.search(MAIN_PATH_SECTION_PATTERN, rendered)
     alt_match = re.search(ALT_PATH_SECTION_PATTERN, rendered)
+
+    _, main_removed_kinds = _retain_route_context(main_match.group("body"), return_metadata=True)
+    _, alt_removed_kinds = _retain_route_context(alt_match.group("body"), return_metadata=True)
+    if "drop_empty_template" in main_removed_kinds | alt_removed_kinds:
+        display_warnings.append("미채움 경로 template 제거")
 
     probabilities = contract.get("probabilities") if contract else None
     if contract and contract.get("direction") != "횡보":
