@@ -139,6 +139,25 @@ TF_STANDARD_MINUTES = {
     "1h": 60, "2h": 120, "4h": 240, "6h": 360, "8h": 480,
     "12h": 720, "1d": 1440, "3d": 4320, "1w": 10080, "1M": 43200,
 }
+TF_UNIT_MINUTES = {"m": 1, "h": 60, "d": 1440, "w": 10080, "M": 43200}
+KOREAN_TF_UNITS = {"분": "m", "시간": "h", "일": "d", "주": "w", "월": "M", "개월": "M"}
+
+
+def _canonical_timeframe_from_minutes(minutes):
+    """표준 TF 표에 정확히 존재하는 분 단위만 canonical code로 반환한다."""
+    matches = [name for name, value in TF_STANDARD_MINUTES.items() if value == minutes]
+    return matches[0] if len(matches) == 1 else ""
+
+
+def format_phase1_tf_heading(tf):
+    """PHASE 1 표시 제목을 code 우선·한글 병기 단일 형식으로 만든다."""
+    match = re.fullmatch(r"(\d+)(m|h|d|w|M)", str(tf or ""))
+    if not match:
+        return ""
+    number, unit = match.groups()
+    suffix = {"m": "분봉", "h": "시간봉", "d": "일봉", "w": "주봉", "M": "월봉"}[unit]
+    korean = suffix if number == "1" and unit in ("d", "w", "M") else f"{number}{suffix}"
+    return f"🔹 {tf} ({korean})"
 
 
 def normalize_timeframes(raw_tfs):
@@ -153,7 +172,7 @@ def normalize_timeframes(raw_tfs):
         if not match or int(match.group(1)) <= 0:
             return None, f"지원하지 않는 시간대(TF)입니다: {token}"
         number, unit = int(match.group(1)), match.group(2)
-        raw_minutes = number * {"m": 1, "h": 60, "d": 1440, "w": 10080, "M": 43200}[unit]
+        raw_minutes = number * TF_UNIT_MINUTES[unit]
         upper = [name for name, minutes in TF_STANDARD_MINUTES.items() if minutes >= raw_minutes]
         if not upper:
             return None, f"표준 범위를 초과하는 시간대(TF)입니다: {token}"
@@ -843,11 +862,27 @@ PHASE1_FACT_LABELS = (
 
 
 def normalize_phase1_tf_heading(raw_heading):
-    """PHASE 1 제목의 한글 병기를 제거하고 사용자 지정 표준 TF 코드만 식별한다."""
+    """PHASE 1/2 제목의 code·한글·병기 표기를 하나의 표준 TF로 식별한다.
+
+    허용값은 TF_STANDARD_MINUTES에 정확히 존재하는 TF뿐이다. 제목 안의 code와 한글
+    단위가 서로 다르면 아무 TF에도 결속하지 않아 사실 오귀속을 막는다.
+    """
     heading = str(raw_heading or "").strip()
-    match = re.match(r"^(\d+[mhdwM])(?=\s|$|\()", heading)
-    tf = match.group(1) if match else ""
-    return tf if tf in TF_STANDARD_MINUTES else ""
+    candidates = set()
+    for match in re.finditer(r"(?<![A-Za-z0-9])(\d+[mhdwM])(?![A-Za-z0-9])", heading):
+        code = match.group(1)
+        if code in TF_STANDARD_MINUTES:
+            candidates.add(code)
+    for match in re.finditer(r"(?<!\d)(?:(\d+)\s*)?(개월|시간|분|일|주|월)\s*봉?", heading):
+        raw_number, korean_unit = match.groups()
+        if not raw_number and korean_unit not in ("일", "주", "월", "개월"):
+            continue
+        count = int(raw_number or "1")
+        minutes = count * TF_UNIT_MINUTES[KOREAN_TF_UNITS[korean_unit]]
+        canonical = _canonical_timeframe_from_minutes(minutes)
+        if canonical:
+            candidates.add(canonical)
+    return next(iter(candidates)) if len(candidates) == 1 else ""
 
 
 def phase1_registry_timeframes(registry):
@@ -2211,6 +2246,10 @@ def run_phase1(symbol_input, exchange_name, custom_tfs):
             f"각 TF의 '원천 데이터 품질 감사' 상태가 데이터결손/판정불가이면, PHASE 1의 해당 카드 항목을 생략하지 말고 "
             f"필요한 곳에 [데이터결손/판정불가]를 그대로 기록하십시오. 해당 TF의 결손 데이터를 구조·RSI·VSA·가격 판단으로 보완·추정하지 마십시오. "
             f"수집 스냅샷 감사가 시간비동기이면 OI/Whale Wall은 동시 스냅샷 사실로 과장하지 말고 상태만 보존하십시오.\n\n"
+            f"[PHASE 1 TF 제목 계약]\n"
+            f"이번 실제 수집 TF 블록의 제목은 순서와 값대로 반드시 다음 형식을 사용하십시오: "
+            f"{' / '.join(filter(None, (format_phase1_tf_heading(tf) for tf in custom_tfs)))}. "
+            f"TF code·한글 병기·순서를 바꾸거나 임의 TF를 추가하지 마십시오.\n\n"
             f"지금은 PHASE 1만 수행하십시오.\n"
             f"PHASE 1 표 작성을 완료한 뒤, 엔진에 규정된 PHASE 1 최종 종료 고정 문구를 출력하고 멈추십시오.\n"
             f"PHASE 2 관련 서술·해석·전략은 절대 출력하지 마십시오."
@@ -2960,7 +2999,11 @@ def render_verified_phase2_decision_blocks(text, contract, quote, all_validation
 
 
 TF_ANALYSIS_HEADING_PATTERN = re.compile(
-    r"(?ms)(?P<heading>^\s*▶️\s*(?P<tf>1w|1d|4h|1h|15m|5m)\s*타임\s*프레임\s*분석\s*\n)(?P<body>.*?)(?=^\s*▶️\s*(?:1w|1d|4h|1h|15m|5m)\s*타임\s*프레임\s*분석|^\s*5️⃣|\Z)"
+    r"(?ms)(?P<heading>^\s*▶️\s*(?P<tf_heading>[^\n]*?)\s*타임\s*프레임\s*분석\s*\n)"
+    r"(?P<body>.*?)(?=^\s*▶️\s*[^\n]*?\s*타임\s*프레임\s*분석\s*\n|^\s*5️⃣|\Z)"
+)
+PHASE2_INTEGRATION_SECTION_PATTERN = re.compile(
+    r"(?ms)(?P<header>^\s*5️⃣[^\n]*\n)(?P<body>.*?)(?=^\s*6️⃣|\Z)"
 )
 
 
@@ -2986,6 +3029,14 @@ def _phase2_tf_evidence_units(body):
     return max(len(narrative_lines), sentence_count)
 
 
+def _phase1_fact_value(tf, label, phase1_fact_registry):
+    entry = (phase1_fact_registry or {}).get(f"{tf}:{label}")
+    if not isinstance(entry, dict):
+        return ""
+    value = str(entry.get("value") or "").strip()
+    return "" if "데이터결손/판정불가" in value else value
+
+
 def _phase2_tf_backfill_facts(tf, body, phase1_fact_registry, required_count):
     """PHASE 1 registry의 같은 TF 사실만 사용해 모자란 본문 근거 행을 만든다."""
     if required_count <= 0 or not isinstance(phase1_fact_registry, dict):
@@ -2997,7 +3048,9 @@ def _phase2_tf_backfill_facts(tf, body, phase1_fact_registry, required_count):
         if not isinstance(entry, dict) or entry.get("tf") != tf:
             continue
         label = str(entry.get("label") or "").strip()
-        value = str(entry.get("value") or "").strip()
+        if label in {"현재가", "현재 진행 봉", "구조 돌파"}:
+            continue
+        value = _phase1_fact_value(tf, label, phase1_fact_registry)
         if not label or not value or value in source or value in seen_values:
             continue
         selected.append(f"근거: [{label}] {value}")
@@ -3007,21 +3060,84 @@ def _phase2_tf_backfill_facts(tf, body, phase1_fact_registry, required_count):
     return selected
 
 
+def _phase2_tf_opposing_facts(tf, body, phase1_fact_registry):
+    """방향성 판정과 반대인 같은 TF 구조가 있을 때만 균형 사실 한 줄을 반환한다."""
+    _, normalized, _ = _phase2_tf_body_lines(body)
+    direction_line = next((line for line in normalized if line.startswith("방향성 판정:")), "")
+    direction = "하방" if "하방" in direction_line else "상방" if "상방" in direction_line else ""
+    if not direction:
+        return []
+    opposite_words = ("상승", "상방") if direction == "하방" else ("하락", "하방")
+    for label in ("다중 스윙 및 채널 패턴", "최근 3봉 기하학 및 시퀀스", "구조 상태"):
+        value = _phase1_fact_value(tf, label, phase1_fact_registry)
+        if value and any(word in value for word in opposite_words) and value not in str(body or ""):
+            return [f"근거 균형: [{label}] {value}"]
+    return []
+
+
+def _phase2_tf_missing_state_facts(tf, body, phase1_fact_registry):
+    """상세 본문이 있어도 현재 진행봉·미확정 경계를 빠뜨리면 같은 TF 사실만 보완한다."""
+    source = str(body or "")
+    current_price = _phase1_fact_value(tf, "현재가", phase1_fact_registry)
+    current_candle = _phase1_fact_value(tf, "현재 진행 봉", phase1_fact_registry)
+    structure_break = _phase1_fact_value(tf, "구조 돌파", phase1_fact_registry)
+    facts = []
+    if current_candle and current_candle not in source:
+        parts = [f"[현재 진행 봉] {current_candle}"]
+        if current_price and current_price not in source:
+            parts.insert(0, f"[현재가] {current_price}")
+        facts.append("현재 진행 관측: " + " / ".join(parts) + " — 진행봉이므로 구조 확정 판단에는 사용하지 않음")
+    if structure_break and re.search(r"(미확정|보류|대기)", structure_break) and structure_break not in source:
+        facts.append(f"근거 경계: [구조 돌파] {structure_break}")
+    return facts
+
+
+def _phase2_integration_missing_boundary(tf_registry, integration_body):
+    """5️⃣에 실제 수집 TF의 진행봉 구조 미확정 경계가 없을 때만 한 줄을 만든다."""
+    source = str(integration_body or "")
+    boundaries = []
+    for tf in phase1_registry_timeframes(tf_registry):
+        structure_break = _phase1_fact_value(tf, "구조 돌파", tf_registry)
+        if structure_break and re.search(r"(미확정|보류|대기)", structure_break) and structure_break not in source:
+            boundaries.append(f"[{tf} 구조 돌파] {structure_break}")
+    if not boundaries:
+        return ""
+    return "통합 근거 경계: " + " / ".join(boundaries)
+
+
+def _ensure_phase2_integration_boundary(text, phase1_fact_registry):
+    """통합 서술을 새 방향 판단 없이 PHASE 1 미확정 경계로만 보완한다."""
+    observations = []
+
+    def replace(match):
+        boundary = _phase2_integration_missing_boundary(phase1_fact_registry, match.group("body"))
+        if not boundary:
+            return match.group("header") + match.group("body")
+        observations.append("INTEGRATION_BOUNDARY_BACKFILLED")
+        body = match.group("body")
+        trailing_newlines = re.search(r"\n*$", body).group(0)
+        return match.group("header") + body.rstrip("\n") + "\n\n" + boundary + trailing_newlines
+
+    return PHASE2_INTEGRATION_SECTION_PATTERN.sub(replace, str(text or "")), observations
+
+
 def ensure_phase2_tf_narrative_completeness(text, phase1_fact_registry):
-    """제목·방향만 남은 TF에만 PHASE 1 사실 행을 보완하며 카드 발행은 막지 않는다."""
+    """제목·방향만 남은 TF와 진행봉·미확정 경계 누락 TF에만 PHASE 1 사실 행을 보완한다."""
     source = str(text or "")
     backfill_observations = []
 
     def replace(match):
-        tf = match.group("tf")
+        tf = normalize_phase1_tf_heading(match.group("tf_heading"))
         body = match.group("body")
-        evidence_units = _phase2_tf_evidence_units(body)
-        if evidence_units >= 2:
+        if not tf:
             return match.group("heading") + body
+        evidence_units = _phase2_tf_evidence_units(body)
         lines, _, direction_index = _phase2_tf_body_lines(body)
         if direction_index is None:
             return match.group("heading") + body
-        facts = _phase2_tf_backfill_facts(tf, body, phase1_fact_registry, 2 - evidence_units)
+        facts = _phase2_tf_missing_state_facts(tf, body, phase1_fact_registry)
+        facts.extend(_phase2_tf_backfill_facts(tf, body, phase1_fact_registry, max(0, 2 - evidence_units - len(facts))))
+        facts.extend(_phase2_tf_opposing_facts(tf, body, phase1_fact_registry))
         if not facts:
             return match.group("heading") + body
         trailing_newlines = re.search(r"\n*$", body).group(0)
@@ -3031,15 +3147,18 @@ def ensure_phase2_tf_narrative_completeness(text, phase1_fact_registry):
         backfill_observations.append(f"TF_EVIDENCE_BACKFILLED:{tf}:{len(facts)}")
         return match.group("heading") + rendered_body
 
-    return TF_ANALYSIS_HEADING_PATTERN.sub(replace, source), backfill_observations
+    rendered = TF_ANALYSIS_HEADING_PATTERN.sub(replace, source)
+    rendered, integration_observations = _ensure_phase2_integration_boundary(rendered, phase1_fact_registry)
+    return rendered, backfill_observations + integration_observations
 
 
 def phase2_briefing_completeness_observations(text):
     """TF 제목·방향만 남거나 방향 아래 근거가 한 개 이하인 경우만 내부 관측한다."""
     observations = []
     for match in TF_ANALYSIS_HEADING_PATTERN.finditer(str(text or "")):
-        if _phase2_tf_evidence_units(match.group("body")) < 2:
-            observations.append(f"BRIEFING_THIN_TF:{match.group('tf')}")
+        tf = normalize_phase1_tf_heading(match.group("tf_heading"))
+        if tf and _phase2_tf_evidence_units(match.group("body")) < 2:
+            observations.append(f"BRIEFING_THIN_TF:{tf}")
     return observations
 
 
@@ -3340,7 +3459,7 @@ def run_phase2(phase1_result, symbol, exchange_name, phase1_canonical=None, phas
         f"[개별 TF 완결성 계약] 정상 또는 부분수집 TF마다 4️⃣에서 제목·방향성 판정만 남기지 말고, PHASE 1에 실제 있는 구조/패턴, 거래량·감속, RSI·다이버전스, F코드, FVG·OB·중첩 구간 중 최소 두 근거를 TF와 함께 1~2문장으로 결속하십시오. 제목 요약 문구와 방향성 판정 행은 근거 수에 포함하지 말고, 방향성 판정 다음에 실제 근거 문장을 작성하십시오. 특정 근거가 없으면 없는 수치를 만들지 말고 그 항목만 언급하지 마십시오. 데이터결손/판정불가 TF만 그 정확한 결손 사유를 쓰십시오. "
         f"서로 다른 TF의 구간을 하나의 원천 구간처럼 합치거나, 1h F2·4h F3처럼 TF별 F코드를 다른 TF에 귀속하지 마십시오. 복수 TF 구간을 함께 말할 때는 ‘복합 지지/저항대’라고 하고 각 TF 값을 분리해 쓰십시오. "
         f"plugin_context.nearest_support_wall과 nearest_resistance_wall이 모두 있으면 현재가 인접 매수·매도벽을 각각 한 번씩 조건부 수급 경계로 결속하십시오. Volume Delta·OI 상태가 ‘근거에 사용 금지’이면 5️⃣ 또는 6️⃣에 결손/비적용 사실만 한 문장으로 밝히고 방향·가격 근거로 사용하지 마십시오. "
-        f"data_quality_boundaries에 ‘데이터결손/판정불가’가 있으면 그 TF의 해당 지표만 판정불가라고 정확히 쓰고, TF 전체 데이터 결손으로 과장하지 마십시오. 슬롯의 값·TF·상태를 바꾸거나 없는 숫자를 보완하지 말고, 모든 슬롯을 기계적으로 나열하지도 마십시오. "
+        f"[근거 균형·결론 강도 계약] 1️⃣·4️⃣·5️⃣에서 한 방향 근거만 나열하지 말고, 같은 TF에 실제 있는 반대 구조·반대 시퀀스·진행봉 구조 돌파 미확정·데이터결손 중 분석에 중요한 경계가 있으면 한 문장으로 함께 결속하십시오. 진행봉의 고가·저가·중심가·현재가는 관측 사실이며, 저점 시험 뒤 현재가 회복 등은 ‘진행 중 반등/되돌림 관측’으로만 서술하십시오. 진행봉 또는 구조 돌파 미확정 상태만으로 추세 전환·돌파 확정을 단정하지 말고, 무엇이 확정되거나 이탈할 때 해당 시나리오가 강화·약화되는지 조건부로 쓰십시오. 이 계약은 Python 검증 ledger의 방향·우세등급·가격·확률을 바꾸지 않습니다. data_quality_boundaries에 ‘데이터결손/판정불가’가 있으면 그 TF의 해당 지표만 판정불가라고 정확히 쓰고, TF 전체 데이터 결손으로 과장하지 마십시오. 슬롯의 값·TF·상태를 바꾸거나 없는 숫자를 보완하지 말고, 모든 슬롯을 기계적으로 나열하지도 마십시오. "
         f"'시스템 무결성 검증 완료', 'API Direct Data Parsing 완료', 'Layer 5-B 인라인 검증 100% 통과' 태그는 절대 작성하지 마십시오. "
         f"ledger에는 같은 결론의 검증용 원장과 기존 Final_신뢰도점수(0~5.9)를 final_confidence_score로 작성하십시오. ledger.price_path는 횡보가 아니면 P_entry=수치 | P_inv=수치 | P_target_1=수치 | P_target_2=수치 네 필드를 각각 한 번씩 반드시 작성하고, 방향의 가격 순서와 일치시켜야 합니다. ledger.bundles의 각 항목은 문자열이 아니라 "
         f"tf·window·fact·fact_ref·direction·role·axis 일곱 필드를 모두 가진 JSON 객체여야 합니다. "
