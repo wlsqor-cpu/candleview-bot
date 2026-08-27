@@ -842,13 +842,32 @@ PHASE1_FACT_LABELS = (
 )
 
 
+def normalize_phase1_tf_heading(raw_heading):
+    """PHASE 1 제목의 한글 병기를 제거하고 사용자 지정 표준 TF 코드만 식별한다."""
+    heading = str(raw_heading or "").strip()
+    match = re.match(r"^(\d+[mhdwM])(?=\s|$|\()", heading)
+    tf = match.group(1) if match else ""
+    return tf if tf in TF_STANDARD_MINUTES else ""
+
+
+def phase1_registry_timeframes(registry):
+    """PHASE 1에 실제 수집·표시된 표준 TF만 상위→하위 순으로 반환한다."""
+    observed = {
+        str(item.get("tf")) for item in (registry or {}).values()
+        if isinstance(item, dict) and str(item.get("tf")) in TF_STANDARD_MINUTES
+    }
+    return sorted(observed, key=lambda tf: TF_STANDARD_MINUTES[tf], reverse=True)
+
+
 def build_phase1_fact_registry(phase1_result):
-    """이미 표시할 PHASE 1 카드에서 TF별 핵심 사실을 추가 모델 호출 없이 추출한다."""
+    """이미 표시할 PHASE 1 카드에서 모든 사용자 지정 표준 TF의 핵심 사실을 추출한다."""
     registry = {}
     text = str(phase1_result or "")
     section_pattern = r"(?ms)^🔹\s*([^\n]+)\n(.*?)(?=^🔹\s*|\Z)"
     for section_match in re.finditer(section_pattern, text):
-        tf = section_match.group(1).strip()
+        tf = normalize_phase1_tf_heading(section_match.group(1))
+        if not tf:
+            continue
         body = section_match.group(2)
         for label in PHASE1_FACT_LABELS:
             fact_match = re.search(rf"(?m)^{re.escape(label)}\s*\n([^\n]+)", body)
@@ -860,13 +879,13 @@ def build_phase1_fact_registry(phase1_result):
 
 
 def build_phase2_evidence_slots(phase1_result, phase1_fact_registry):
-    """PHASE 1 사실만으로 최종 브리핑의 누락 방지 근거 슬롯을 만든다.
+    """PHASE 1 사실만으로 모든 실제 수집 TF의 브리핑 누락 방지 슬롯을 만든다.
 
     이 함수는 점수·방향·가격을 계산하거나 새 시장 데이터를 만들지 않는다. 모델이 PHASE 1에
-    이미 표시된 구조·구간·보조지표 상태를 자연어에 빠뜨리지 않도록 작은 선택 목록만 제공한다.
+    이미 표시된 진행봉·구조·구간·보조지표 상태를 자연어에 빠뜨리지 않도록 선택 목록만 제공한다.
     """
     registry = phase1_fact_registry or {}
-    timeframes = ("1w", "1d", "4h", "1h")
+    timeframes = phase1_registry_timeframes(registry)
 
     def value(tf, label):
         item = registry.get(f"{tf}:{label}")
@@ -887,10 +906,23 @@ def build_phase2_evidence_slots(phase1_result, phase1_fact_registry):
         "order_block": value("1d", "세력 매물대"),
         "overlap_zone": value("1d", "중첩 매물대"),
     }
-    short_tf_zones = []
-    for tf in ("4h", "1h"):
+    tf_current_states = []
+    for tf in timeframes:
         item = {
             "tf": tf,
+            "current_price": value(tf, "현재가"),
+            "current_candle": value(tf, "현재 진행 봉"),
+        }
+        if item["current_price"] or item["current_candle"]:
+            tf_current_states.append(item)
+
+    short_tf_zones = []
+    for tf in timeframes:
+        if TF_STANDARD_MINUTES[tf] >= TF_STANDARD_MINUTES["1d"]:
+            continue
+        item = {
+            "tf": tf,
+            "current_candle": value(tf, "현재 진행 봉"),
             "structure_break": value(tf, "구조 돌파"),
             "fvg": value(tf, "가격 공백대"),
             "order_block": value(tf, "세력 매물대"),
@@ -898,7 +930,7 @@ def build_phase2_evidence_slots(phase1_result, phase1_fact_registry):
             "volume_decay": value(tf, "거래량 배율 및 감속 추세"),
             "force": value(tf, "F1~F4 역학 코드"),
         }
-        if any(item[key] for key in ("structure_break", "fvg", "order_block", "volume_decay", "force")):
+        if any(item[key] for key in ("current_candle", "structure_break", "fvg", "order_block", "volume_decay", "force")):
             short_tf_zones.append(item)
 
     text = str(phase1_result or "")
@@ -922,15 +954,14 @@ def build_phase2_evidence_slots(phase1_result, phase1_fact_registry):
     support_walls = [line for line in whale_walls if line.startswith("매수벽")]
     resistance_walls = [line for line in whale_walls if line.startswith("매도벽")]
     data_quality_boundaries = {
-        "1w_divergence_status": value("1w", "다이버전스 / 추세 건전성"),
-        "1d_divergence_status": value("1d", "다이버전스 / 추세 건전성"),
-        "4h_divergence_status": value("4h", "다이버전스 / 추세 건전성"),
-        "1h_divergence_status": value("1h", "다이버전스 / 추세 건전성"),
+        f"{tf}_divergence_status": value(tf, "다이버전스 / 추세 건전성")
+        for tf in timeframes
     }
     return {
         "schema": "PHASE2_EVIDENCE_SLOTS_V2",
         "role_reversal_references": structure_references,
         "daily_context": daily_context,
+        "tf_current_states": tf_current_states,
         "short_tf_zones": short_tf_zones,
         "plugin_context": {
             "whale_walls": whale_walls[:4],
@@ -3305,7 +3336,7 @@ def run_phase2(phase1_result, symbol, exchange_name, phase1_canonical=None, phas
         f"다만 1️⃣의 메인·대체 시나리오 경로에서는 가격·확률 숫자를 직접 쓰지 말고, 각 라벨과 보조 레벨(FVG·Role Reversal·돌파선·다음 매물대)만 작성하십시오. "
         f"Python이 검증 완료된 ledger 값으로 진입·무효화·목표가·확률을 표시합니다. "
         f"[필수 근거 슬롯 서술 계약] 문체와 문단 구성은 자연스럽게 작성하되, daily_context.overlap_zone이 실제 값이면 그 1d 구간을 대체 시나리오 Role Reversal에 TF 라벨과 함께 숫자 또는 범위로 한 번 명시하십시오. 값이 없을 때만 role_reversal_references의 실제 구조상태·돌파 값을 사용하십시오. FVG·돌파선·Role Reversal·다음 매물대는 PHASE 1의 TF와 실제 값 또는 범위를 함께 쓸 수 있을 때만 경로에 넣고, 값이 없으면 해당 라벨 줄 자체를 쓰지 마십시오. "
-        f"daily_context의 구조·패턴·거래량/감속·F코드는 1d 설명 또는 TF 상관관계에 한 문장으로 결속하십시오. short_tf_zones는 4h/1h 설명 또는 TF 상관관계에서 실제 FVG·세력 매물대·중첩 매물대 중 분석에 필요한 최대 두 구간만 TF 라벨과 함께 사용하십시오. "
+        f"daily_context가 실제 값이면 1d 설명 또는 TF 상관관계에 구조·패턴·거래량/감속·F코드를 한 문장으로 결속하십시오. tf_current_states는 이번 PHASE 1에서 실제 수집된 모든 사용자 지정 TF의 현재가와 현재 진행 봉입니다. 각 TF의 4️⃣ 설명은 같은 TF의 tf_current_states가 실제로 있을 때 직전 완성봉의 확정 사실과 구분하여 현재 진행 상태를 한 문장으로 결속하십시오. 진행봉을 근거로 BOS/CHoCH 또는 확정형 패턴을 단정하지 말고, 저점 시험 뒤 현재가 회복처럼 관측되는 되돌림은 ‘진행 중’으로만 서술하십시오. short_tf_zones는 1d 미만의 실제 선택 TF에서 FVG·세력 매물대·중첩 매물대 중 분석에 필요한 최대 두 구간만 TF 라벨과 함께 사용하십시오. "
         f"[개별 TF 완결성 계약] 정상 또는 부분수집 TF마다 4️⃣에서 제목·방향성 판정만 남기지 말고, PHASE 1에 실제 있는 구조/패턴, 거래량·감속, RSI·다이버전스, F코드, FVG·OB·중첩 구간 중 최소 두 근거를 TF와 함께 1~2문장으로 결속하십시오. 제목 요약 문구와 방향성 판정 행은 근거 수에 포함하지 말고, 방향성 판정 다음에 실제 근거 문장을 작성하십시오. 특정 근거가 없으면 없는 수치를 만들지 말고 그 항목만 언급하지 마십시오. 데이터결손/판정불가 TF만 그 정확한 결손 사유를 쓰십시오. "
         f"서로 다른 TF의 구간을 하나의 원천 구간처럼 합치거나, 1h F2·4h F3처럼 TF별 F코드를 다른 TF에 귀속하지 마십시오. 복수 TF 구간을 함께 말할 때는 ‘복합 지지/저항대’라고 하고 각 TF 값을 분리해 쓰십시오. "
         f"plugin_context.nearest_support_wall과 nearest_resistance_wall이 모두 있으면 현재가 인접 매수·매도벽을 각각 한 번씩 조건부 수급 경계로 결속하십시오. Volume Delta·OI 상태가 ‘근거에 사용 금지’이면 5️⃣ 또는 6️⃣에 결손/비적용 사실만 한 문장으로 밝히고 방향·가격 근거로 사용하지 마십시오. "
