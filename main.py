@@ -2987,8 +2987,9 @@ def _classify_route_context_line(line):
     if re.search(r"(확률|현재가|진입|목표|무효화|손절)", text) and re.search(r"\d", text):
         return "drop_unverified_decision"
     if re.fullmatch(
-        r"\s*(?:[➔•-]\s*)?\(확률\s*(?:(?:\(\s*수치\s*\)\s*%?)|%)?"
-        r"\s*(?:(?:—|--|-)\s*참고용,\s*백테스트\s*검증치\s*아님)?\s*\)",
+        r"\s*(?:[➔•-]\s*)?(?:\(\s*)?확률(?:\s*:\s*)?\s*"
+        r"(?:\(\s*수치\s*\)|수치)?\s*\)?\s*%?"
+        r"(?:\s*(?:—|--|-)\s*참고용,\s*백테스트\s*검증치\s*아님)?\s*\)?\s*",
         text,
     ):
         return "drop_empty_template"
