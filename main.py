@@ -898,14 +898,20 @@ def build_phase1_fact_registry(phase1_result):
     """이미 표시할 PHASE 1 카드에서 모든 사용자 지정 표준 TF의 핵심 사실을 추출한다."""
     registry = {}
     text = str(phase1_result or "")
-    section_pattern = r"(?ms)^🔹\s*([^\n]+)\n(.*?)(?=^🔹\s*|\Z)"
+    # PHASE 1 모델 원문은 사양상 **현재가**·**현재 진행 봉**처럼 Markdown 굵게 표식을 포함할 수 있다.
+    # Telegram 표시본에서는 표식이 제거되므로, raw 원문과 표시형 모두 같은 registry로 읽는다.
+    bold_wrapper = r"(?:\*\*)?"
+    section_pattern = rf"(?ms)^\s*{bold_wrapper}\s*🔹\s*([^\n]+)\n(.*?)(?=^\s*{bold_wrapper}\s*🔹\s*|\Z)"
     for section_match in re.finditer(section_pattern, text):
         tf = normalize_phase1_tf_heading(section_match.group(1))
         if not tf:
             continue
         body = section_match.group(2)
         for label in PHASE1_FACT_LABELS:
-            fact_match = re.search(rf"(?m)^{re.escape(label)}\s*\n([^\n]+)", body)
+            fact_match = re.search(
+                rf"(?m)^\s*{bold_wrapper}\s*{re.escape(label)}\s*{bold_wrapper}\s*\n([^\n]+)",
+                body,
+            )
             if not fact_match:
                 continue
             fact_ref = f"{tf}:{label}"
