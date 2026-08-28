@@ -3062,10 +3062,11 @@ def _strip_nonroute_probability_lines(text, main_match, alt_match):
     return "".join(pieces), removed
 
 
-def render_verified_phase2_decision_blocks(text, contract, quote, all_validation_warnings=None, display_warnings=None):
-    """메인·대체 경로 전체를 단일 출처로 렌더링해 자연어 라벨 변형과 전역 치환을 차단한다."""
+def render_verified_phase2_decision_blocks(text, contract, quote, all_validation_warnings=None, display_warnings=None, phase1_fact_registry=None):
+    """메인·대체 경로와 분석 대상 현재가를 검증된 PHASE 1 출처로 렌더링한다."""
     rendered = _strip_model_phase2_success_tag(text)
-    display_warnings = list(display_warnings or [])
+    rendered, target_price_warnings = normalize_phase2_analysis_target_current_price(rendered, phase1_fact_registry)
+    display_warnings = list(display_warnings or []) + target_price_warnings
     main_match = re.search(MAIN_PATH_SECTION_PATTERN, rendered)
     alt_match = re.search(ALT_PATH_SECTION_PATTERN, rendered)
     if not (main_match and alt_match):
@@ -3124,6 +3125,10 @@ TF_ANALYSIS_HEADING_PATTERN = re.compile(
 PHASE2_INTEGRATION_SECTION_PATTERN = re.compile(
     r"(?ms)(?P<header>^\s*5️⃣[^\n]*\n)(?P<body>.*?)(?=^\s*6️⃣|\Z)"
 )
+PHASE2_ANALYSIS_TARGET_SECTION_PATTERN = re.compile(
+    r"(?ms)(?P<header>^\s*(?:\*\*)?\s*분석 대상\s*(?:\*\*)?\s*\n)(?P<body>.*?)(?=^\s*(?:\*\*)?\s*방향성 평가\s*(?:\*\*)?\s*$)"
+)
+PHASE2_ANALYSIS_TARGET_PRICE_PATTERN = re.compile(r"\(\s*현재가\s*:\s*[^)\r\n]+\)")
 
 
 def _phase2_tf_body_lines(body):
@@ -3154,6 +3159,39 @@ def _phase1_fact_value(tf, label, phase1_fact_registry):
         return ""
     value = str(entry.get("value") or "").strip()
     return "" if "데이터결손/판정불가" in value else value
+
+
+def _phase2_analysis_target_current_price(phase1_fact_registry):
+    """최단 정상 선택 TF의 origin current close만 최상단 현재가 표시에 사용한다."""
+    for tf in reversed(phase1_registry_timeframes(phase1_fact_registry)):
+        item = (phase1_fact_registry or {}).get(f"{tf}:현재가")
+        if not isinstance(item, dict) or item.get("source") != "stage0_origin_current_ohlcv":
+            continue
+        value = _phase1_fact_value(tf, "현재가", phase1_fact_registry)
+        if re.search(r"[-+]?\d", value):
+            return value
+    return ""
+
+
+def normalize_phase2_analysis_target_current_price(text, phase1_fact_registry):
+    """1️⃣ 분석 대상의 모델 현재가 표기를 preserved PHASE 1 origin close로만 치환한다."""
+    rendered = str(text or "")
+    match = re.search(PHASE2_ANALYSIS_TARGET_SECTION_PATTERN, rendered)
+    if not match:
+        return rendered, []
+    source_price = _phase2_analysis_target_current_price(phase1_fact_registry)
+    price_match = re.search(PHASE2_ANALYSIS_TARGET_PRICE_PATTERN, match.group("body"))
+    if not source_price or not price_match:
+        return rendered, []
+    canonical_price = f"(현재가: {source_price})"
+    if price_match.group(0) == canonical_price:
+        return rendered, []
+    replacement_body = (
+        match.group("body")[:price_match.start()]
+        + canonical_price
+        + match.group("body")[price_match.end():]
+    )
+    return rendered[:match.start()] + match.group("header") + replacement_body + rendered[match.end():], ["분석 대상 현재가 source 정규화"]
 
 
 def _phase2_tf_backfill_facts(tf, body, phase1_fact_registry, required_count):
@@ -3684,6 +3722,7 @@ def run_phase2(phase1_result, symbol, exchange_name, phase1_canonical=None, phas
                     symbol.rsplit("/", 1)[-1] if "/" in symbol else "",
                     all_validation_warnings=[f"P2S01 ledger repair 호출 실패: {failure_kind}"],
                     display_warnings=["구조화 ledger 복구 미완료"],
+                    phase1_fact_registry=phase1_fact_registry,
                 )
                 observe(
                     "STRUCTURED_LEDGER_OBSERVED", attempt=attempt + 1, rule_ids=["P2S01", rule_id],
@@ -3739,6 +3778,7 @@ def run_phase2(phase1_result, symbol, exchange_name, phase1_canonical=None, phas
                     symbol.rsplit("/", 1)[-1] if "/" in symbol else "",
                     all_validation_warnings=blocking_structured_warnings,
                     display_warnings=["구조화 ledger 복구 미완료"],
+                    phase1_fact_registry=phase1_fact_registry,
                 )
                 observe(
                     "STRUCTURED_LEDGER_OBSERVED", attempt=attempt + 1, rule_ids=["P2S01"],
@@ -3799,6 +3839,7 @@ def run_phase2(phase1_result, symbol, exchange_name, phase1_canonical=None, phas
             symbol.rsplit("/", 1)[-1] if "/" in symbol else "",
             all_validation_warnings=list(validation_warnings) + list(provenance_warnings),
             display_warnings=display_warnings,
+            phase1_fact_registry=phase1_fact_registry,
         )
         published_briefing, tf_backfill_observations = ensure_phase2_tf_narrative_completeness(
             published_briefing, phase1_fact_registry
