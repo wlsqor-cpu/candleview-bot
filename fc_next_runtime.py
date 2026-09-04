@@ -29,10 +29,6 @@ CURRENT_INFRA_COLLECTION_CONFIG = {
         max_workers=4, time_budget_seconds=120,
         daily_time_budget_seconds=90, intraday_time_budget_seconds=18, p0_time_budget_seconds=12,
     ),
-    "coinbase": CollectionConfig(
-        max_workers=4, time_budget_seconds=120,
-        daily_time_budget_seconds=90, intraday_time_budget_seconds=18, p0_time_budget_seconds=12,
-    ),
 }
 
 

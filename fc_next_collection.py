@@ -18,7 +18,7 @@ import time
 from fc_next_core import ScanConfig, state3_intraday_data_required
 
 STABLECOIN_BASES = {"USDT", "USDC", "DAI", "TUSD", "PAX", "GUSD", "PYUSD", "BUSD", "USDP", "FDUSD"}
-INTRADAY_TIMEFRAME_BY_EXCHANGE = {"upbit": "4h", "bithumb": "4h", "coinbase": "6h"}
+INTRADAY_TIMEFRAME_BY_EXCHANGE = {"upbit": "4h", "bithumb": "4h"}
 TIMEFRAME_MS = {"1d": 86_400_000, "4h": 14_400_000, "6h": 21_600_000}
 
 

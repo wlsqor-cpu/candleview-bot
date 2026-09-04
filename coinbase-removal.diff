@@ -1,0 +1,131 @@
+diff --git a/fc_next_collection.py b/fc_next_collection.py
+index 3f75877..89ed034 100644
+--- a/fc_next_collection.py
++++ b/fc_next_collection.py
+@@ -18,7 +18,7 @@ import time
+ from fc_next_core import ScanConfig, state3_intraday_data_required
+ 
+ STABLECOIN_BASES = {"USDT", "USDC", "DAI", "TUSD", "PAX", "GUSD", "PYUSD", "BUSD", "USDP", "FDUSD"}
+-INTRADAY_TIMEFRAME_BY_EXCHANGE = {"upbit": "4h", "bithumb": "4h", "coinbase": "6h"}
++INTRADAY_TIMEFRAME_BY_EXCHANGE = {"upbit": "4h", "bithumb": "4h"}
+ TIMEFRAME_MS = {"1d": 86_400_000, "4h": 14_400_000, "6h": 21_600_000}
+ 
+ 
+diff --git a/fc_next_runtime.py b/fc_next_runtime.py
+index 03ceea5..4f3ddc9 100644
+--- a/fc_next_runtime.py
++++ b/fc_next_runtime.py
+@@ -29,10 +29,6 @@ CURRENT_INFRA_COLLECTION_CONFIG = {
+         max_workers=4, time_budget_seconds=120,
+         daily_time_budget_seconds=90, intraday_time_budget_seconds=18, p0_time_budget_seconds=12,
+     ),
+-    "coinbase": CollectionConfig(
+-        max_workers=4, time_budget_seconds=120,
+-        daily_time_budget_seconds=90, intraday_time_budget_seconds=18, p0_time_budget_seconds=12,
+-    ),
+ }
+ 
+ 
+diff --git a/main.py b/main.py
+index c275de4..758f27e 100644
+--- a/main.py
++++ b/main.py
+@@ -16,22 +16,20 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+ import backtest_framework
+ 
+ # ============================================================
+-# 거래소 인식 — 검증된 3개로 고정 (V003 신뢰성 검증 결과 반영)
++# 거래소 인식 — 검증된 2개로 고정 (V003 신뢰성 검증 결과 반영 + 코인베이스 제외)
+ # 바이낸스·바이비트·쿠코인 등은 Render(AWS US) 환경에서 미국IP 지오블록에 걸려
+-# 에러가 발생하므로 지원 대상에서 제외한다. 아래 3개는 지오블록 없음이 확인됨.
+-# 코인베이스는 USDT가 아닌 USD가 표준 페어이므로 quote를 USD로 고정한다.
++# 에러가 발생하므로 지원 대상에서 제외한다. 아래 2개는 지오블록 없음이 확인됨.
++# 코인베이스는 지원 대상에서 제외한다(운영 범위를 업비트·빗썸 KRW 현물로 한정).
+ # ============================================================
+ SUPPORTED_EXCHANGES = {
+     # 1w는 거래소 API 지원여부와 무관하게 항상 일봉 리샘플링으로 생성(resample_daily_to_weekly)하므로
+-    # 3개 거래소 모두 동일 패턴(1w,1d,X,1h)을 안전하게 사용할 수 있다.
++    # 2개 거래소 모두 동일 패턴(1w,1d,X,1h)을 안전하게 사용할 수 있다.
+     # 빗썸 4h: ccxt 정적목록엔 없지만 실사용으로 정상 동작 확인됨 → 포함.
+-    # 코인베이스 4h: 실제 API 호출 시 확정 오류("granularity 4h is not a valid value") 확인됨 → 제외, 6h로 대체.
+     "upbit":    {"quote": "KRW", "kr_name": "업비트",   "default_tfs": ["1w", "1d", "4h", "1h"]},
+     "bithumb":  {"quote": "KRW", "kr_name": "빗썸",     "default_tfs": ["1w", "1d", "4h", "1h"]},
+-    "coinbase": {"quote": "USD", "kr_name": "코인베이스", "default_tfs": ["1w", "1d", "6h", "1h"]},
+ }
+ 
+-EXCHANGE_KR_MAP = {"업비트": "upbit", "빗썸": "bithumb", "코인베이스": "coinbase"}
++EXCHANGE_KR_MAP = {"업비트": "upbit", "빗썸": "bithumb"}
+ 
+ # ============================================================
+ # 비인가 입력(슬래시 명령이 아닌 임의 입력) 안내 문구
+@@ -40,17 +38,14 @@ UNAUTHORIZED_INPUT_GUIDE = (
+     "본 시스템은 분석입력, 출력 외 다른 기능은 제공되지 않습니다.\n\n"
+     "<b>▶️ 지정코인 분석 명령어</b>\n"
+     "/거래소 + 코인명 을 입력해주세요. (한글·영문 모두 가능)\n\n"
+-    "예시) /업비트 비트코인   또는   /coinbase btc\n\n"
++    "예시) /업비트 비트코인   또는   /빗썸 리플\n\n"
+     "시간대(TF)는 자동으로 적용됩니다.\n"
+     "• 업비트·빗썸: 1주, 1일, 4시간, 1시간\n"
+-    "• 코인베이스: 1주, 1일, 6시간, 1시간\n"
+     "필요시 직접 지정도 가능합니다: /업비트 비트코인 1d 4h 1h\n\n"
+     "<b>한글 코인명 안내</b>\n"
+-    "업비트·빗썸은 각 거래소 상장목록 기준 한글 인식됩니다.\n"
+-    "코인베이스는 자체 한글명이 없어 업비트·빗썸에도 상장된 코인만\n"
+-    "한글 인식되며, 코인베이스 전용 코인은 영문 심볼로 입력해 주세요.\n\n"
++    "업비트·빗썸은 각 거래소 상장목록 기준 한글 인식됩니다.\n\n"
+     "<b>지원 거래소</b>\n"
+-    "업비트(KRW) · 빗썸(KRW) · 코인베이스(USD)\n\n"
++    "업비트(KRW) · 빗썸(KRW)\n\n"
+     "<b>🔎 FindCoin</b>\n"
+     "현재 시세분출 가능성이 높은 코인을 분석해서 Top3를 알려드립니다.\n"
+     "/거래소 만 입력하면 실행됩니다. (예: /업비트)\n"
+@@ -1522,7 +1517,7 @@ def fetch_volume_delta_summary(exchange, symbol, timeframe, limit=120):
+ 
+ # ============================================================
+ # OI 교차거래소 조회 기능 정지 스위치
+-# 사유: 현재 지원 3개 거래소(업비트/빗썸/코인베이스)는 전부 순수 현물마켓이라
++# 사유: 현재 지원 2개 거래소(업비트/빗썸)는 전부 순수 현물마켓이라
+ # 자체 OI가 원천적으로 존재하지 않는다(미결제약정은 선물/무기한계약 전용 개념).
+ # 유일한 경로였던 교차거래소 조회(바이낸스/바이비트/OKX)도 Render(AWS US)
+ # 환경에서 전부 미국IP 지오블록 대상이라 매 시도가 실패하며 최대 8초
+@@ -2274,7 +2269,7 @@ def run_phase1(symbol_input, exchange_name, custom_tfs):
+         if ex_name is None:
+             return (
+                 "지원하지 않는 거래소입니다.\n"
+-                "현재 지원 거래소: 업비트 · 빗썸 · 코인베이스",
++                "현재 지원 거래소: 업비트 · 빗썸",
+                 None, None, None
+             )
+ 
+@@ -2311,7 +2306,7 @@ def run_phase1(symbol_input, exchange_name, custom_tfs):
+         # 제거한다. 실제 미지원 TF는 fetch_ohlcv 실패 시 friendly_error_message가 안전하게 안내한다.
+ 
+         # [결함수정] HOTD/LOTD(당일 고/저) 판정용 KST 기준 '오늘' 경계를 미리 계산한다.
+-        # ccxt는 업비트·빗썸·코인베이스 전부 동일한 UTC epoch 타임스탬프로 표준화하여 반환하므로,
++        # ccxt는 업비트·빗썸 전부 동일한 UTC epoch 타임스탬프로 표준화하여 반환하므로,
+         # 거래소와 무관하게 KST 기준 하나로 통일 적용한다(실사용 확인: 이 기준이 없어 Gemini가
+         # "오늘"에 해당하는 봉을 추측해야 했음 — Plugin5 HOTD/LOTD Sweep 채점 항목에 직접 영향).
+         now_kst = datetime.now(timezone.utc) + timedelta(hours=9)
+@@ -4785,7 +4780,7 @@ TRACKING_ENABLED = bool(NOTION_TOKEN and NOTION_DATA_SOURCE_ID)
+ OUTCOME_CHECK_INTERVAL_SECONDS = 60 * 60  # 1시간마다 미결 건 점검
+ OUTCOME_MAX_HOLD_DAYS = 20  # 위 주석 참조 — 확정값 아님
+ 
+-EXCHANGE_CCXT_ID = {"UPBIT": "upbit", "BITHUMB": "bithumb", "COINBASE": "coinbase"}
++EXCHANGE_CCXT_ID = {"UPBIT": "upbit", "BITHUMB": "bithumb"}
+ 
+ 
+ def _resolve_ccxt_exchange_id(exchange_label):
+@@ -5277,11 +5272,10 @@ while True:
+                         "[지정코인 분석 예시]\n"
+                         "• /업비트 비트코인\n"
+                         "• /빗썸 리플\n"
+-                        "• /coinbase eth\n"
+                         "• /업비트 비트코인 1d 4h 1h  (TF 직접 지정)\n\n"
+                         "[FindCoin — Top3 스크리닝]\n"
+-                        "• /업비트   또는   /coinbase\n\n"
+-                        "지원 거래소: 업비트 · 빗썸 · 코인베이스"
++                        "• /업비트   또는   /빗썸\n\n"
++                        "지원 거래소: 업비트 · 빗썸"
+                     ),
+                 )
+                 continue
